@@ -48,6 +48,9 @@ export class PolymarketWsClient {
   private readonly books = new Map<string, LiveBook>();
   private readonly waiters = new Map<string, Waiter[]>();
   private pingTimer?: NodeJS.Timeout;
+  private keepAlive = true;
+  private reconnectAttempts = 0;
+  private reconnectTimer?: NodeJS.Timeout;
   private userSocket?: WebSocket;
   private userConnecting?: Promise<void>;
   private userSubscribed = false;
@@ -76,6 +79,7 @@ export class PolymarketWsClient {
   async subscribeMarkets(tokenIds: string[]): Promise<void> {
     const ids = tokenIds.filter(Boolean);
     if (ids.length === 0) return;
+    this.keepAlive = true;
     let added = false;
     for (const id of ids) {
       if (!this.desiredAssets.has(id)) {
@@ -179,6 +183,11 @@ export class PolymarketWsClient {
   }
 
   close(): void {
+    this.keepAlive = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
     this.socket?.close();
     this.socket = undefined;
     this.connected = false;
@@ -239,6 +248,7 @@ export class PolymarketWsClient {
   }
 
   private async subscribe(tokenId: string): Promise<void> {
+    this.keepAlive = true;
     this.desiredAssets.add(tokenId);
     await this.ensureConnected();
     if (this.subscribedAssets.has(tokenId)) return;
@@ -261,6 +271,7 @@ export class PolymarketWsClient {
         (socket as unknown as { _socket?: { unref?: () => void } })._socket?.unref?.();
         this.socket = socket;
         this.connected = true;
+        this.reconnectAttempts = 0;
         this.connecting = undefined;
         this.subscribedAssets.clear();
         socket.on('message', (data) => this.onMessage(data));
@@ -291,6 +302,19 @@ export class PolymarketWsClient {
       clearInterval(this.pingTimer);
       this.pingTimer = undefined;
     }
+    if (this.keepAlive && this.desiredAssets.size > 0) this.scheduleReconnect();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || this.connecting) return;
+    const delay = Math.min(30_000, 500 * 2 ** Math.min(this.reconnectAttempts, 6));
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (!this.keepAlive || this.desiredAssets.size === 0) return;
+      this.ensureConnected().catch(() => this.scheduleReconnect());
+    }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   private onMessage(data: WebSocket.RawData): void {
