@@ -1,0 +1,137 @@
+dataDir: .safe-mm
+liveEnabled: false
+
+endpointPolicy:
+  allowCustom: false
+
+risk:
+  orderSizeUsd: 25
+  maxSingleOrderUsd: 100
+  maxPositionUsd: 100
+  maxDailyLossUsd: 50
+  maxAccountRiskStaleMs: 120000
+  maxOpenOrderReserveDriftUsd: 2
+  maxOpenOrderReserveDriftPct: 25
+  settlementNoNewOrdersMs: 1800000
+  settlementCancelOpenOrdersMs: 600000
+  shortEventMaxDurationMs: 43200000
+  eventStartNoNewOrdersMs: 1800000
+  eventStartCancelOpenOrdersMs: 600000
+  maxOpenOrdersPerMarket: 4
+  maxMarkets: 20
+  staleBookMs: 1500
+  minDepthUsdPerSide: 25
+  minPrice: 0.08
+  maxPrice: 0.92
+  minSpreadBps: 80
+  maxSpreadBps: 600
+  requirePostOnly: true
+
+strategy:
+  optimizerMode: points
+  tradingMode: conservative
+  pointsOnly: true
+  acceptingOnly: true
+  autoSelectMarkets: true
+  minMarketLiquidityUsd: 0
+  minRewardLevel: 0
+  minRewardSizeMultiplier: 1
+  enforceRewardMinimum: true
+  candidateLimit: 12
+  switchThresholdPct: 15
+  gasBufferMultiplier: 1.35
+  fallbackSplitMergeGasUnits: 450000
+  minSwitchBenefitMultiplier: 4
+  minSwitchEdgeAfterGasUsd: 0.05
+  minSafeHoursForSwitch: 0.5
+  bnbUsdForGasEstimate: 650
+  entryMode: cash
+  dualSide: false
+  quoteSide: buy
+  quoteRefreshMs: 2000
+  marketRefreshMs: 60000
+  conservativeDepthLevel: 3
+  aggressiveDepthLevel: 3
+  retreatTicks: 1
+  replaceThresholdTicks: 1
+  cashProbeMinFrontDepthUsd: 100
+  cashProbeDepthMultiplier: 2
+  cashProbeMaxSupportGapCents: 1.5
+  cashProbeNeverTopOfBook: true
+  cancelOutsideReward: true
+  onFillAction: hold
+  cashOnFillAction: sellWithinLossCap
+  cashMaxExitLossPct: 30
+  liquidationSlippageTicks: 2
+  liquidationMaxSlippageCents: 10
+  minPositionSizeToLiquidate: 0.0001
+  balanceReserveUsd: 200
+  inventorySkewEnabled: false
+  maxInventorySkewUsd: 50
+  dedupeMarketGroups: true
+  maxTokensPerMarket: 2
+  # Polymarket only: false=单边 BUY 做市(默认,低风险,不累积双向库存);
+  # true=两侧 LP 做市(同组 YES/NO 都挂 BUY,吃满两侧奖励加成,但会持有库存,
+  # 退出只能 hold 或 reduce-only 限价卖,且关闭单边成交熔断,靠账户总止损兜底)。
+  polymarketTwoSidedLp: false
+  # 单市场双边 LP 两腿合计预算 USD(YES+NO 平分)。
+  polymarketLpTotalUsd: 20
+  # 同时做几个 Polymarket 市场的双边 LP(默认 1,单市场专注;可调多个)。
+  polymarketMaxMarkets: 1
+  # 本金止损全退 USD:Polymarket 本轮亏损达到此值就撤单 + reduce-only 全退出并停止做市,需手动重启。0=只用 maxDailyLossUsd。
+  polymarketMaxLossUsd: 0
+  # Polymarket 日奖励发放门槛 USD:预计日奖励低于此值不发放(平台 $1/日,8 点后到账),低于则跳过该市场不空挂浪费资金。
+  polymarketMinDailyRewardUsd: 1
+  # Polymarket 两侧 LP 挂单起始挡位:1=最前(买一),2=前面留一挡,越大越安全(越不容易被吃,奖励略低)。
+  polymarketStartLevel: 2
+  # Polymarket 两侧 LP 前方保护深度 USD:你的单子前面至少要有这么多别人的挂单挡着,不够就撤退到更深处或跳过。
+  polymarketFrontDepthUsd: 150
+  # Polymarket 换市场优势 %(独立于 Predict 的 switchThresholdPct):新市场资金效率超过当前 ×(1+此值)才切。
+  polymarketSwitchThresholdPct: 20
+  # Polymarket 单 token 持仓上限 USD(独立于全局 maxPositionUsd):0=沿用全局;>0=Polymarket 用这个独立上限。
+  polymarketMaxPositionUsd: 0
+  # Polymarket 小额测试模式:true=放宽 min_shares / $1门槛 / 波动过滤 / 前方深度,让小额(如 polymarketLpTotalUsd=5)能挂出来验证流程(不赚奖励);正式刷奖励时关掉。
+  polymarketTestMode: false
+  # 盘口获取方式(每个市场各自一份)。默认 true=用一条持久 WebSocket 订阅扫描中的市场、从推送缓存读盘口
+  # (不花 REST,WS 没有新盘口时自动回退 REST),所以"能同时挂多少市场"跟随 maxMarkets,不再被 REST 速率卡。
+  # 选市场/换盘口/深度/挂单策略都不变,只是盘口数据来源变了。想退回旧的 REST-only 抓取再设 false。
+  wsWatchAll: true
+
+# ===== Polymarket 完全独立的参数块(零回退到上面的 Predict 参数)=====
+# 不写也行:首次加载会自动从上面的 risk/strategy 复制一份生成,之后你在 PL 页面/这里改动都只影响 Polymarket,
+# 跟 Predict 互不干扰。结构和上面的 risk + strategy 完全一样,每个字段都是 Polymarket 自己的。
+# polymarketParams:
+#   risk:
+#     orderSizeUsd: 5          # Polymarket 自己的单笔金额(跟 Predict 无关)
+#     maxDailyLossUsd: 8       # Polymarket 自己的总止损
+#     maxMarkets: 1            # Polymarket 自己的同时挂单市场数
+#   strategy:
+#     quoteRefreshMs: 2000     # Polymarket 自己的刷新间隔
+#     wsWatchAll: true         # Polymarket 也用 WS 盘口优化
+#     polymarketTwoSidedLp: false
+
+venues:
+  predict:
+    enabled: true
+    apiBaseUrl: https://api.predict.fun
+    wsUrl: wss://ws.predict.fun/ws
+    rpcUrl: https://bsc-dataseed.binance.org
+    chainId: 56
+    apiKey: ""
+    accountAddress: ""
+  polymarket:
+    enabled: true
+    gammaUrl: https://gamma-api.polymarket.com
+    clobUrl: https://clob.polymarket.com
+    rpcUrl: https://polygon-bor-rpc.publicnode.com
+    chainId: 137
+    funderAddress: ""
+    signatureType: 0
+    autoDeriveApiKey: true
+    wsUrl: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    # 实时流盘口(只盯正在挂单的市场),默认关;在你的环境验证过再开,REST 是回退。
+    useWsOrderbook: false
+
+selectedMarkets:
+  predict: []
+  polymarket: []

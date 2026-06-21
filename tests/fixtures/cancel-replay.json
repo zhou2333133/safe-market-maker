@@ -1,0 +1,98 @@
+[
+  {
+    "name": "replace-price-drift",
+    "mode": "replaceable",
+    "openOrders": [
+      { "externalId": "old-maker", "tokenId": "token-replay", "side": "BUY", "price": 0.46, "size": 10 }
+    ],
+    "markets": [
+      { "tokenId": "token-replay", "endTimeOffsetMs": 3600000 }
+    ],
+    "books": [
+      {
+        "tokenId": "token-replay",
+        "bids": [
+          { "price": 0.49, "size": 1000 },
+          { "price": 0.48, "size": 1000 },
+          { "price": 0.47, "size": 1000 }
+        ],
+        "asks": [
+          { "price": 0.51, "size": 1000 },
+          { "price": 0.52, "size": 1000 },
+          { "price": 0.53, "size": 1000 }
+        ]
+      }
+    ],
+    "desiredIntents": [
+      { "tokenId": "token-replay", "side": "BUY", "price": 0.49, "size": 10 }
+    ],
+    "expectedCanceledIds": ["old-maker"],
+    "expectedEventType": "quote.replace-cancel"
+  },
+  {
+    "name": "previous-route-no-longer-selected",
+    "mode": "replaceable",
+    "extraManagedTokens": ["previous-token"],
+    "openOrders": [
+      { "externalId": "previous-maker", "tokenId": "previous-token", "side": "BUY", "price": 0.49, "size": 10 }
+    ],
+    "markets": [
+      { "tokenId": "new-token", "endTimeOffsetMs": 3600000 }
+    ],
+    "books": [
+      {
+        "tokenId": "new-token",
+        "bids": [
+          { "price": 0.49, "size": 1000 },
+          { "price": 0.48, "size": 1000 },
+          { "price": 0.47, "size": 1000 }
+        ],
+        "asks": [
+          { "price": 0.51, "size": 1000 },
+          { "price": 0.52, "size": 1000 },
+          { "price": 0.53, "size": 1000 }
+        ]
+      }
+    ],
+    "desiredIntents": [
+      { "tokenId": "new-token", "side": "BUY", "price": 0.49, "size": 10 }
+    ],
+    "expectedCanceledIds": ["previous-maker"],
+    "expectedEventType": "quote.replace-cancel"
+  },
+  {
+    "name": "near-settlement-blocks-new-orders-but-keeps-open-orders",
+    "mode": "guarded",
+    "openOrders": [
+      { "externalId": "near-settlement-maker", "tokenId": "token-replay", "side": "BUY", "price": 0.49, "size": 10 }
+    ],
+    "markets": [
+      { "tokenId": "token-replay", "endTimeOffsetMs": 1200000 }
+    ],
+    "expectedCanceledIds": []
+  },
+  {
+    "name": "settlement-cancel-window-cancels-open-orders",
+    "mode": "guarded",
+    "openOrders": [
+      { "externalId": "closing-maker", "tokenId": "token-replay", "side": "BUY", "price": 0.49, "size": 10 }
+    ],
+    "markets": [
+      { "tokenId": "token-replay", "endTimeOffsetMs": 300000 }
+    ],
+    "expectedCanceledIds": ["closing-maker"],
+    "expectedEventType": "risk.market-guard.cancel"
+  },
+  {
+    "name": "unknown-end-time-cancels-open-orders",
+    "mode": "guarded",
+    "openOrders": [
+      { "externalId": "unknown-end-maker", "tokenId": "token-replay", "side": "BUY", "price": 0.49, "size": 10 }
+    ],
+    "markets": [
+      { "tokenId": "token-replay", "endTimeOffsetMs": null }
+    ],
+    "expectedCanceledIds": ["unknown-end-maker"],
+    "expectedEventType": "risk.market-guard.cancel"
+  }
+]

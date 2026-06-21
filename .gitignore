@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.safe-mm/
+config.yaml
+*.log
+.understand-anything/
+.claude/
+tmp-*
+monitor*.log

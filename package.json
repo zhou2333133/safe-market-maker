@@ -1,0 +1,54 @@
+{
+  "name": "safe-market-maker",
+  "version": "0.1.0",
+  "description": "Low-risk CLI market maker core for Predict.fun and Polymarket",
+  "type": "module",
+  "bin": {
+    "mm": "dist/src/cli/index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "audit:prod": "npm audit --omit=dev --audit-level=moderate",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run secret-scan"
+  },
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "0.0.10",
+    "@polymarket/clob-client-v2": "1.0.6",
+    "@predictdotfun/sdk": "1.2.8",
+    "@types/ws": "^8.5.13",
+    "axios": "1.17.0",
+    "better-sqlite3": "11.7.0",
+    "commander": "12.1.0",
+    "ethers": "6.15.0",
+    "viem": "2.52.2",
+    "ws": "8.20.1",
+    "yaml": "2.8.3",
+    "zod": "3.24.1"
+  },
+  "overrides": {
+    "@polymarket/builder-relayer-client": {
+      "axios": "1.17.0"
+    },
+    "ws": "8.20.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.4",
+    "@types/better-sqlite3": "7.6.12",
+    "@types/node": "22.12.0",
+    "@typescript-eslint/eslint-plugin": "8.20.0",
+    "@typescript-eslint/parser": "8.20.0",
+    "eslint": "9.39.4",
+    "tsx": "4.21.0",
+    "typescript": "5.7.3",
+    "typescript-eslint": "8.20.0",
+    "vitest": "4.1.5"
+  }
+}

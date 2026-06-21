@@ -1,0 +1,118 @@
+{
+  "predictLossLimit": {
+    "now": "2026-05-20T10:05:00Z",
+    "maxDailyLossUsd": 10,
+    "fills": [
+      {
+        "id": "predict-loss-fill-1",
+        "type": "MATCH",
+        "side": "BUY",
+        "tokenId": "predict-token",
+        "price": "0.50",
+        "shares": "20",
+        "realizedPnlUsd": "-12.50",
+        "feeUsd": "0.03",
+        "createdAt": "2026-05-20T10:00:00Z"
+      }
+    ],
+    "positions": [],
+    "balances": [
+      {
+        "asset": "USDT",
+        "available": 87.47,
+        "total": 87.47
+      }
+    ],
+    "expectedReason": "daily-loss-limit",
+    "expectedDailyPnlUsd": -12.5
+  },
+  "polymarketStaleSnapshot": {
+    "now": "2026-05-20T10:05:00Z",
+    "capturedAt": "2026-05-20T10:00:00Z",
+    "maxAccountRiskStaleMs": 60000,
+    "fills": [
+      {
+        "id": "poly-fill-1",
+        "asset": "poly-token",
+        "side": "SELL",
+        "price": "0.52",
+        "size": "10",
+        "realizedPnl": "0.25",
+        "timestamp": 1779271200
+      }
+    ],
+    "positions": [
+      {
+        "asset": "poly-token",
+        "size": "4",
+        "currentValue": "2.08"
+      }
+    ],
+    "balances": [
+      {
+        "asset": "USDC",
+        "available": 100,
+        "total": 100
+      }
+    ],
+    "expectedReason": "snapshot-stale"
+  },
+  "missingPnlWithLiveExposure": {
+    "now": "2026-05-20T10:05:00Z",
+    "capturedAt": "2026-05-20T10:05:00Z",
+    "maxAccountRiskStaleMs": 60000,
+    "fills": [
+      {
+        "id": "predict-fill-without-pnl",
+        "type": "MATCH",
+        "side": "BUY",
+        "tokenId": "predict-token",
+        "price": "0.50",
+        "shares": "20",
+        "createdAt": "2026-05-20T10:04:30Z"
+      }
+    ],
+    "positions": [
+      {
+        "token_id": "predict-token",
+        "shares": "20",
+        "valueUsd": "10.00"
+      }
+    ],
+    "balances": [
+      {
+        "asset": "USDT",
+        "available": 90,
+        "total": 90
+      }
+    ],
+    "expectedReason": "snapshot-unavailable"
+  },
+  "reserveDrift": {
+    "orderSizeUsd": 8,
+    "balanceReserveUsd": 1,
+    "maxOpenOrderReserveDriftUsd": 2,
+    "maxOpenOrderReserveDriftPct": 25,
+    "balances": [
+      {
+        "asset": "USDC",
+        "available": 19,
+        "total": 40
+      }
+    ],
+    "openOrders": [
+      {
+        "venue": "polymarket",
+        "externalId": "poly-open-buy",
+        "tokenId": "poly-token",
+        "side": "BUY",
+        "price": 0.5,
+        "size": 10,
+        "status": "OPEN"
+      }
+    ],
+    "expectedReason": "reserve-drift",
+    "expectedActualFrozenUsd": 21,
+    "expectedReservedOpenOrdersUsd": 5
+  }
+}

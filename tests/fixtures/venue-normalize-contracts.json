@@ -1,0 +1,192 @@
+{
+  "predict": {
+    "market": {
+      "id": "predict-market-comma",
+      "conditionId": "0xpredictCamelCondition",
+      "question": "Predict comma-number fixture",
+      "trading_status": "OPEN",
+      "volume_24h": "12,345.67",
+      "liquidityUsd": "45,678.90",
+      "accepting_orders_until": "2026-05-20T11:30:00Z",
+      "endDate": "2026-05-20T12:00:00Z",
+      "resolutionTime": "2026-05-20T13:00:00Z",
+      "isYieldBearing": true,
+      "fee_rate_bps": "12",
+      "tick_size": "0.01",
+      "liquidityActivation": {
+        "minShares": "100",
+        "maxSpreadCents": "6",
+        "ppPerHour": "4,200"
+      },
+      "outcomes": [
+        {
+          "name": "YES",
+          "onChainId": "predict-token-yes"
+        },
+        {
+          "name": "NO",
+          "onChainId": "predict-token-no"
+        }
+      ]
+    },
+    "expectedFirstMarket": {
+      "tokenId": "predict-token-yes",
+      "marketId": "predict-market-comma",
+      "conditionId": "0xpredictCamelCondition",
+      "volume24hUsd": 12345.67,
+      "liquidityUsd": 45678.9,
+      "endTime": "2026-05-20T11:30:00.000Z",
+      "endTimeSource": "order-deadline",
+      "yieldBearing": true,
+      "rewards": {
+        "enabled": false,
+        "level": 5,
+        "minShares": 100,
+        "maxSpreadCents": 6,
+        "ppPerHour": 4200
+      }
+    },
+    "snakeCaseOutcomeMarket": {
+      "id": "predict-market-snake-outcome",
+      "question": "Predict snake outcome fixture",
+      "trading_status": "OPEN",
+      "volume24hUsd": "1,000",
+      "liquidityUsd": "10,000",
+      "last_order_time": "2026-05-20T11:00:00Z",
+      "end_date": "2026-05-20T12:00:00Z",
+      "reward_rules": {
+        "min_shares": "150",
+        "max_spread": "0.05",
+        "points_per_hour": "1,500"
+      },
+      "outcomes": [
+        {
+          "outcome": "UP",
+          "token_id": "predict-token-up"
+        }
+      ]
+    },
+    "expectedSnakeCaseOutcomeMarket": {
+      "tokenId": "predict-token-up",
+      "outcome": "UP",
+      "endTime": "2026-05-20T11:00:00.000Z",
+      "endTimeSource": "order-deadline",
+      "rewards": {
+        "enabled": false,
+        "level": 4,
+        "minShares": 150,
+        "maxSpreadCents": 5,
+        "ppPerHour": 1500
+      }
+    }
+  },
+  "polymarket": {
+    "rewardsByToken": {
+      "poly-token-yes": {
+        "enabled": true,
+        "level": 5,
+        "minShares": 100,
+        "maxSpreadCents": 6,
+        "dailyRate": 12,
+        "reason": "polymarket-rewards"
+      }
+    },
+    "market": {
+      "id": "poly-market-comma",
+      "conditionId": "poly-condition",
+      "question": "Polymarket comma-number fixture",
+      "active": true,
+      "closed": false,
+      "acceptingOrders": true,
+      "volume24hr": "22,222.22",
+      "liquidityNum": "33,333.33",
+      "orderDeadline": "2026-05-20T10:50:00Z",
+      "endDate": "2026-05-20T12:00:00Z",
+      "settlementTime": "2026-05-20T13:00:00Z",
+      "minimumTickSize": "0.01",
+      "outcomes": "[\"YES\",\"NO\"]",
+      "clobTokenIds": "[\"poly-token-yes\",\"poly-token-no\"]"
+    },
+    "expectedFirstMarket": {
+      "tokenId": "poly-token-yes",
+      "marketId": "poly-market-comma",
+      "conditionId": "poly-condition",
+      "volume24hUsd": 22222.22,
+      "liquidityUsd": 33333.33,
+      "endTime": "2026-05-20T10:50:00.000Z",
+      "endTimeSource": "order-deadline",
+      "rewards": {
+        "enabled": true,
+        "level": 5,
+        "minShares": 100,
+        "maxSpreadCents": 6,
+        "dailyRate": 12
+      }
+    },
+    "officialOpenOrder": {
+      "id": "official-open-order",
+      "status": "LIVE",
+      "owner": "0xowner",
+      "maker_address": "0xmaker",
+      "market": "poly-condition",
+      "asset_id": "poly-token-yes",
+      "side": "BUY",
+      "original_size": "100.00",
+      "size_matched": "84.00",
+      "price": "0.50",
+      "associate_trades": [],
+      "outcome": "YES",
+      "created_at": 1779271200,
+      "expiration": "0",
+      "order_type": "GTC"
+    },
+    "expectedOfficialOpenOrder": {
+      "externalId": "official-open-order",
+      "tokenId": "poly-token-yes",
+      "side": "BUY",
+      "price": 0.5,
+      "size": 16
+    },
+    "officialBalanceAllowance": {
+      "balance": "40.00",
+      "allowance": "999999999"
+    },
+    "expectedOfficialBalance": {
+      "asset": "pUSD",
+      "available": 40,
+      "total": 40
+    },
+    "arrayTokenMarket": {
+      "id": "poly-array-market",
+      "condition_id": "poly-array-condition",
+      "title": "Polymarket array token fixture",
+      "active": true,
+      "closed": false,
+      "accepting_orders": true,
+      "volume": "11,111.11",
+      "liquidity": "22,222.22",
+      "last_order_time": "2026-05-20T10:40:00Z",
+      "end_date": "2026-05-20T12:00:00Z",
+      "resolution_time": "2026-05-20T13:00:00Z",
+      "tick_size": "0.01",
+      "outcomes": ["UP", "DOWN"],
+      "clobTokenIds": ["poly-array-up", "poly-array-down"]
+    },
+    "expectedArrayTokenMarket": {
+      "tokenId": "poly-array-up",
+      "conditionId": "poly-array-condition",
+      "outcome": "UP",
+      "volume24hUsd": 11111.11,
+      "liquidityUsd": 22222.22,
+      "endTime": "2026-05-20T10:40:00.000Z",
+      "endTimeSource": "order-deadline",
+      "rewards": {
+        "enabled": true,
+        "level": 3,
+        "minShares": 200,
+        "maxSpreadCents": 3,
+        "dailyRate": 8
+      }
+    }
+  }
+}
