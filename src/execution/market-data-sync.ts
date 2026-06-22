@@ -219,11 +219,22 @@ export class MarketDataSyncService {
     const now = Date.now();
     const ttlMs = routeOrderbookCacheTtlMs(this.config);
     const cachedBooks = sharedOrderbookCache(this.config, venue);
+    const wsCacheEnabled = this.wsWatchEnabled(venue);
     const books = new Map(freshBooks);
     for (const market of markets) {
       if (market.venue !== venue) continue;
       if (books.has(market.tokenId) || failedTokenIds.has(market.tokenId)) continue;
       if (!marketTimeDecision(this.config, market, now).ok) continue;
+      // Try the persistent WS cache first — these books are kept live by the WS subscription, so they're as
+      // fresh as the most recent push from the venue. Without this the route only sees the per-cycle scan-budget
+      // sample (≈4 books) even when WS has hundreds cached; the bot rejects 95% of high-reward candidates with
+      // "盘口不可用" purely because the route never gets the live WS book.
+      const wsBook = wsCacheEnabled ? this.adapter.getCachedOrderbook?.(market.tokenId) : undefined;
+      if (wsBook) {
+        books.set(market.tokenId, wsBook);
+        cachedBooks.set(market.tokenId, wsBook);
+        continue;
+      }
       const cached = cachedBooks.get(market.tokenId);
       if (!cached || now - cached.receivedAt > ttlMs) continue;
       books.set(market.tokenId, cached);
