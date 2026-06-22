@@ -1503,7 +1503,7 @@ describe('strategy and risk', () => {
 
     expect(intents).toEqual([]);
     expect(route?.tradable).toBe(false);
-    expect(route?.riskFlags.join(' ')).toContain('第 4 档支撑');
+    expect(route?.riskFlags.join(' ')).toContain('少于要求 4 档');
   });
 
   it('rejects cash probe BUY quotes when the support gap behind the protected queue is too wide', () => {

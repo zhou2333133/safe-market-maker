@@ -6,7 +6,15 @@ import type { RewardMarketAssessment, RewardQuotePlan, RewardReplaceDecision, Ve
 const CASH_BUY_OVERSIZE_TOLERANCE_USD = 0.25;
 const CASH_BUY_OVERSIZE_TOLERANCE_PCT = 0.05;
 const CASH_BUY_MAINTENANCE_DEPTH_FLOOR_PCT = 0.8;
-const CASH_BUY_MIN_FRONT_LEVELS = 3;
+// Polymarket follows the user's polymarketStartLevel knob: startLevel=2 needs 1 level in front
+// (level 1 = the top), startLevel=3 needs 2, etc. Predict keeps the legacy floor of 3.
+function cashMinFrontLevels(config: AppConfig, market?: Market): number {
+  if (market?.venue === 'polymarket') {
+    const startLevel = Math.max(1, Math.trunc(config.strategy.polymarketStartLevel ?? 2));
+    return Math.max(1, startLevel - 1);
+  }
+  return 3;
+}
 // Polymarket's hard per-order size floor (shares). An order below this is rejected outright by the exchange
 // ("Size (1.23) lower than the minimum: 5"), independent of the much larger reward min_shares.
 const POLYMARKET_MIN_ORDER_SHARES = 5;
@@ -428,10 +436,11 @@ export function rewardQuoteProtection(config: AppConfig, side: OrderSide, price:
     const frontLevels = side === 'BUY'
       ? bids.filter((level) => level.price > price + 1e-9).length
       : asks.filter((level) => level.price < price - 1e-9).length;
-    if (frontLevels < CASH_BUY_MIN_FRONT_LEVELS) {
+    const requiredFrontLevels = cashMinFrontLevels(config, market);
+    if (frontLevels < requiredFrontLevels) {
       return {
         ok: false,
-        reason: `现金单边测试单前方只有 ${frontLevels} 档保护，低于要求 ${CASH_BUY_MIN_FRONT_LEVELS} 档`,
+        reason: `现金单边测试单前方只有 ${frontLevels} 档保护，低于要求 ${requiredFrontLevels} 档`,
         depthUsd: Number(depthUsd.toFixed(4)),
         minDepthUsd
       };
@@ -498,9 +507,10 @@ export function rewardQuoteProtectionDiagnostic(config: AppConfig, side: OrderSi
   const tick = effectiveOrderbookTick(market, book);
   const rewardLevels = aggregateOrderbookLevels(book.bids, 'bids')
     .filter((level) => isWithinRewardBand('BUY', level.price, book, rewards!.maxSpreadCents))
-  if (rewardLevels.length < CASH_BUY_MIN_FRONT_LEVELS + 1) return '现金单边测试单缺少第 4 档支撑，禁止挂到前三档保护不足的位置';
+  const minFront = cashMinFrontLevels(config, market);
+  if (rewardLevels.length < minFront + 1) return `现金单边测试单奖励带内仅 ${rewardLevels.length} 档，少于要求 ${minFront + 1} 档(${minFront} 在前 + 1 支撑)`;
   let firstFailure: string | undefined;
-  for (let frontIndex = CASH_BUY_MIN_FRONT_LEVELS - 1; frontIndex < rewardLevels.length - 1; frontIndex += 1) {
+  for (let frontIndex = minFront - 1; frontIndex < rewardLevels.length - 1; frontIndex += 1) {
     const nearestFront = rewardLevels[frontIndex]!;
     const support = rewardLevels[frontIndex + 1]!;
     let price = roundToTick(support.price + tick, tick, 'BUY');
@@ -621,12 +631,13 @@ function protectedCashBuyRewardLevel(
   const tick = effectiveOrderbookTick(market, book);
   const rewardLevels = aggregateOrderbookLevels(book.bids, 'bids')
     .filter((level) => isWithinRewardBand('BUY', level.price, book, rewards!.maxSpreadCents))
-  if (rewardLevels.length < CASH_BUY_MIN_FRONT_LEVELS + 1) return undefined;
+  const minFront2 = cashMinFrontLevels(config, market);
+  if (rewardLevels.length < minFront2 + 1) return undefined;
   // Honor the user's level: set N → rest at position N (lean on the wall that becomes N+1 = rewardLevels[N-1],
   // i.e. frontIndex N-2). Never shallower than N; if N's exact slot is invalid (out of band / fails protection),
   // step DEEPER for the next valid one (never to the front). No auto cold/hot override — just the configured level.
   const startLevel = market.venue === 'polymarket' ? Math.max(1, Math.trunc(config.strategy.polymarketStartLevel ?? 2)) : Math.max(1, Math.trunc(config.strategy.conservativeDepthLevel ?? 3));
-  const firstFrontIndex = Math.max(CASH_BUY_MIN_FRONT_LEVELS - 1, startLevel - 2);
+  const firstFrontIndex = Math.max(minFront2 - 1, startLevel - 2);
   for (let frontIndex = firstFrontIndex; frontIndex < rewardLevels.length - 1; frontIndex += 1) {
     const nearestFront = rewardLevels[frontIndex]!;
     const support = rewardLevels[frontIndex + 1]!;
