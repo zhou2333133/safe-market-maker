@@ -616,11 +616,11 @@ export class PredictVenue implements VenueAdapter {
       pricePerShareWei: priceWei
     });
     const maker = account ?? signer.address;
-    // Network dead-man switch (ported from Polymarket): when polymarketOrderTtlSec > 0, attach an expiry so the venue
-    // auto-cancels the resting order if the bot/network dies. cancel-service refreshes it before expiry while alive, so
-    // a healthy bot's orders never lapse; only a sustained outage (> ttl) lets them expire. polymarketOrderTtlSec is a
-    // generic per-venue knob despite the prefix (resolved from the base strategy for Predict).
-    const ttlSec = Math.trunc(this.config.strategy.polymarketOrderTtlSec ?? 0);
+    // Network dead-man switch: when predictOrderTtlSec > 0, attach an expiry so the order auto-cancels if the
+    // bot/network dies; cancel-service refreshes it before expiry while alive, so a healthy bot's orders never lapse.
+    // Predict uses its OWN predictOrderTtlSec knob — NOT polymarketOrderTtlSec (that is Polymarket's, kept fully
+    // independent). 0 = no expiry: Predict orders rest indefinitely on the book (current setting).
+    const ttlSec = Math.trunc(this.config.strategy.predictOrderTtlSec ?? 0);
     const order = orderBuilder.buildOrder('LIMIT', {
       maker,
       signer: maker,
