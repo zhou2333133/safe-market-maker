@@ -22,7 +22,10 @@ import { accountRiskWindowStart } from '../risk/risk-window.js';
 import { evaluateAccountRisk } from '../risk/account-risk.js';
 
 const CASH_NEW_ORDER_PAUSE_CHECKPOINT_PREFIX = 'cash-new-order-pause';
-const KILL_EXIT_MAX_ATTEMPTS = 3;
+const KILL_EXIT_MAX_ATTEMPTS = 8;
+// Wait between in-cycle kill-exit retries so chain-confirmed exits free up CTF/USDC balance before the next submit
+// (Polymarket rejects "not enough balance / allowance" until the on-chain settlement of the prior exit lands).
+const KILL_EXIT_BACKOFF_MS = 1500;
 
 export interface RunOnceOptions {
   venue: VenueName;
@@ -41,6 +44,13 @@ export interface RunOnceResult {
   stopRequested?: boolean;
   stopReason?: 'daily-loss-limit' | 'equity-drawdown-limit';
   canceledManagedOrders?: number;
+  /**
+   * Risk-stop fired but positions remain after the in-cycle kill-exit retries. The loop must keep cycling in
+   * exit-only mode (no new entries) until the positions truly clear; only then is it safe to stopRequested.
+   */
+  exitOnlyMode?: boolean;
+  /** Count of material positions remaining when exitOnlyMode is true, for visibility. */
+  exitOnlyPendingPositions?: number;
 }
 
 function accountRiskStopReason(reason: AccountRiskDecision['reason']): RunOnceResult['stopReason'] | undefined {
@@ -136,8 +146,8 @@ export class ExecutionEngine {
         'risk.daily-loss-stop.cancel-managed'
       );
       let killExit: CashFillExitResult | undefined;
-      if (positions.length > 0) {
-        let exitPositions = positions.filter((position) => position.venue === options.venue && isMaterialCashPosition(this.config, position));
+      let exitPositions = positions.filter((position) => position.venue === options.venue && isMaterialCashPosition(this.config, position));
+      if (exitPositions.length > 0) {
         for (let attempt = 0; attempt < KILL_EXIT_MAX_ATTEMPTS && exitPositions.length > 0; attempt += 1) {
           const killMarkets = await this.cashExitMarkets(options.venue, exitPositions);
           this.adapter.hydrateFromMarkets?.(killMarkets);
@@ -150,7 +160,13 @@ export class ExecutionEngine {
             force: true
           });
           killExit = mergeCashExitResults(killExit, exit);
-          if (!exit.attempted || exit.submitted === 0) break;
+          // After each submit (even partial/failed), pause briefly so prior fills/cancels settle on-chain and free up
+          // CTF/USDC balance; "not enough balance / allowance" is the venue's race-condition rejection and clears within
+          // ~1-2s. Then re-sync positions and keep trying as long as positions remain — do NOT break on submitted===0
+          // when positions are still material, because that is exactly when the previous fix mis-bailed.
+          if (attempt + 1 < KILL_EXIT_MAX_ATTEMPTS && exitPositions.length > 0) {
+            await new Promise((resolve) => setTimeout(resolve, KILL_EXIT_BACKOFF_MS));
+          }
           const resync = await this.accountSync.syncPositions({ venue: options.venue, signerAddress });
           if (!resync.ok) break;
           exitPositions = resync.positions.filter((position) => position.venue === options.venue && isMaterialCashPosition(this.config, position));
@@ -164,22 +180,36 @@ export class ExecutionEngine {
         canceledManagedOrders: cancel.canceledIds.length,
         ...(killExit ? { killExit } : {})
       });
-      this.stage(options.venue, 'stopping', '总止损金额已触发，已撤机器人受管挂单并停止实盘，需手动重新开启', {
+      // If positions remain after the in-cycle retries, do NOT stop the loop yet — keep cycling in exit-only mode so
+      // each subsequent cycle re-enters this same branch (account-risk is still tripped) and runs another kill-exit
+      // round. Only set stopRequested when positions are truly clear. This is the fix for "止损停机后没卖完剩仓"
+      // — risk-stop must halt NEW entries, but exiting existing positions is the bot's obligation regardless.
+      const pendingPositions = exitPositions.length;
+      const positionsCleared = pendingPositions === 0;
+      const stageMessage = positionsCleared
+        ? '总止损金额已触发，已撤机器人受管挂单并停止实盘，需手动重新开启'
+        : `总止损金额已触发，仍有 ${pendingPositions} 个未平仓位，仅退出模式继续循环直到清零`;
+      this.stage(options.venue, positionsCleared ? 'stopping' : 'exiting-positions', stageMessage, {
         reason: stopReason,
-        canceledManagedOrders: cancel.canceledIds.length
+        canceledManagedOrders: cancel.canceledIds.length,
+        pendingPositions
       });
       this.store.checkpoint(`route.${options.venue}`, {
         mode: 'live',
-        reason: '总止损金额已触发，已撤机器人受管挂单并停止实盘，需手动重新开启',
+        reason: stageMessage,
         switched: false,
         selected: [],
         candidates: [],
-        stopRequested: true,
+        stopRequested: positionsCleared,
+        exitOnlyMode: !positionsCleared,
+        exitOnlyPendingPositions: pendingPositions,
         stopReason,
         canceledManagedOrders: cancel.canceledIds.length,
         ...(killExit ? { killExit } : {})
       });
-      return { stopRequested: true, stopReason, canceledManagedOrders: cancel.canceledIds.length };
+      return positionsCleared
+        ? { stopRequested: true, stopReason, canceledManagedOrders: cancel.canceledIds.length }
+        : { exitOnlyMode: true, exitOnlyPendingPositions: pendingPositions, stopReason, canceledManagedOrders: cancel.canceledIds.length };
     }
     const fillCircuitBreaker = await this.maybeTripCashFillCircuitBreaker(options, openOrders, positions);
     if (fillCircuitBreaker.tripped) {

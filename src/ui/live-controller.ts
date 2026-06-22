@@ -320,6 +320,19 @@ async function runLiveLoop(
               message: '总止损金额已触发，实盘循环自动停止并禁止自动恢复',
               details: runResult
             });
+          } else if (runResult.exitOnlyMode) {
+            // Risk-stop tripped but positions remain — persist the stop intent so the loop won't auto-resume on restart,
+            // but keep cycling so each cycle re-runs the kill-exit branch until positions truly clear. Emit a single
+            // event per cycle so the user sees pending count drop.
+            clearLiveRunIntent(loaded.dataDir, venue);
+            saveLiveStopIntent(loaded.dataDir, venue, 'risk-stop', '总止损金额触发后自动停止；正在循环退出剩余仓位，清零后才真正停止。');
+            store.recordEvent({
+              venue,
+              severity: 'warn',
+              type: 'ui.live.risk-stop.exiting',
+              message: `总止损已触发，仍有 ${runResult.exitOnlyPendingPositions} 个未平仓位，仅退出模式继续`,
+              details: runResult
+            });
           }
           markLoopCycleCompleted(loop);
           // Stamp the full cycle's COMPLETION time (not its start): a full cycle can itself take longer than
