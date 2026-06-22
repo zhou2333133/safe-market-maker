@@ -31,6 +31,9 @@ const POLYMARKET_REWARD_UNIVERSE_MAX = 800;
 // 60 condition_ids ≈ 4 KB URL, well under nginx's 8 KB default.
 const POLYMARKET_GAMMA_CONDITION_BATCH = 60;
 const POLYMARKET_REWARDS_TTL_MS = 10 * 60 * 1000;
+// Safety cap on /sampling-simplified-markets pagination. ~7 pages cover the entire reward universe (~7000 markets);
+// keeping a headroom of 12 protects against runaway looping if the API ever stops returning next_cursor=LTE=.
+const POLYMARKET_SAMPLING_MAX_PAGES = 12;
 export const POLYMARKET_PUSD = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
 export const POLYMARKET_EXCHANGE_V2 = '0xE111180000d2663C0091e4f400237545B87B996B';
 export const POLYMARKET_NEG_RISK_EXCHANGE_V2 = '0xe2222d279d744050d28e00520010520000310F59';
@@ -856,10 +859,22 @@ export class PolymarketVenue implements VenueAdapter {
     if (this.rewardByToken.size > 0 && Date.now() - this.rewardsLoadedAt < POLYMARKET_REWARDS_TTL_MS) return;
     for (const endpoint of ['/sampling-simplified-markets', '/simplified-markets']) {
       try {
-        const payload = await httpJson<any>(`${this.config.venues.polymarket.clobUrl.replace(/\/+$/, '')}${endpoint}`);
+        const base = `${this.config.venues.polymarket.clobUrl.replace(/\/+$/, '')}${endpoint}`;
+        // Paginate through ALL pages (API default page size is ~1000). Without this, the bot only saw the first-page
+        // arbitrary slice (markets aren't ordered by daily_rate on the wire), so high-rate markets later in pagination
+        // — Strait of Hormuz #11, SPY #12, WTI #13, US-Iran Nuclear #14, all $1000/day — were silently dropped.
+        const entries: any[] = [];
+        let nextCursor: string | undefined;
+        for (let page = 0; page < POLYMARKET_SAMPLING_MAX_PAGES; page += 1) {
+          const url = nextCursor ? `${base}?next_cursor=${encodeURIComponent(nextCursor)}` : base;
+          const payload = await httpJson<any>(url);
+          for (const item of extractList(payload)) entries.push(item);
+          nextCursor = (payload && typeof payload === 'object' ? (payload as Record<string, unknown>).next_cursor : undefined) as string | undefined;
+          if (!nextCursor || nextCursor === 'LTE=' || extractList(payload).length === 0) break;
+        }
         const byToken = new Map<string, Market['rewards']>();
         const ranked: Array<{ conditionId: string; dailyRate: number }> = [];
-        for (const entry of extractList(payload)) {
+        for (const entry of entries) {
           if (entry?.closed === true || entry?.archived === true) continue;
           const rewards = entry?.rewards ?? {};
           const minShares = toFiniteNumber(rewards?.min_size);
