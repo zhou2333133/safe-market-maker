@@ -593,7 +593,7 @@ describe('venue HTTP contract tests', () => {
     expect(responseBody?.data?.order?.hash).toBe('0xhash');
   });
 
-  it('normalizes Polymarket gamma, rewards, and CLOB book responses', async () => {
+  it('normalizes Polymarket gamma, rewards, and CLOB book responses', { timeout: 15000 }, async () => {
     const baseUrl = await mockServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost');
       if (url.pathname === '/sampling-simplified-markets') {

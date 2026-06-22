@@ -89,8 +89,17 @@ export class PolymarketWsClient {
     }
     await this.ensureConnected();
     if (added || this.subscribedAssets.size < this.desiredAssets.size) {
-      this.send({ assets_ids: [...this.desiredAssets], type: 'market' });
-      for (const id of this.desiredAssets) this.subscribedAssets.add(id);
+      // Batch in chunks: one huge subscribe msg with hundreds of asset_ids sometimes causes Polymarket's WS
+      // server to silently drop most snapshots (only ~4 books cached out of 211 watched). Batching keeps each
+      // payload small enough that every subscription gets a snapshot.
+      const pending = [...this.desiredAssets].filter((id) => !this.subscribedAssets.has(id));
+      const targets = pending.length > 0 ? pending : [...this.desiredAssets];
+      const CHUNK = 50;
+      for (let i = 0; i < targets.length; i += CHUNK) {
+        const batch = targets.slice(i, i + CHUNK);
+        this.send({ assets_ids: batch, type: 'market' });
+        for (const id of batch) this.subscribedAssets.add(id);
+      }
     }
   }
 
