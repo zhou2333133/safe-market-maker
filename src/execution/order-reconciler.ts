@@ -1,5 +1,6 @@
 import type { OpenOrder, VenueName } from '../domain/types.js';
 import { rejectReason } from '../risk/reject-reasons.js';
+import { httpErrorDetails } from '../observability/http-error.js';
 import type { StateStore } from '../store/sqlite.js';
 import type { VenueAdapter } from '../venues/types.js';
 
@@ -31,7 +32,7 @@ export class OrderReconciler {
         severity: 'error',
         type: 'open-orders.unavailable',
         message: '开放订单同步失败，本轮不会新增订单',
-        details: { error: message, reject: rejectReason('OPEN_ORDERS_UNAVAILABLE', 'platform', 'syncing-orders') }
+        details: { error: message, ...httpErrorDetails(error), reject: rejectReason('OPEN_ORDERS_UNAVAILABLE', 'platform', 'syncing-orders') }
       });
       this.store.checkpoint(`run.${venue}`, { mode: 'live', skippedQuoting: true, reason: 'open-orders.unavailable' });
       return { ok: false, openOrders: [], error: message };

@@ -122,11 +122,13 @@ export async function startUiServer(configPath: string, options: UiServerOptions
   const url = `http://${host}:${resolvedPort}`;
   singleton?.update({ host, port: resolvedPort, url });
   restoreLiveLoops(loaded.configPath, liveLoops);
+  const watchdog = startLoopStaleWatchdog(loaded.dataDir);
   return {
     url,
     host,
     port: resolvedPort,
     close: () => new Promise<void>((resolve, reject) => {
+      clearInterval(watchdog);
       server.close((error) => {
         singleton?.release();
         if (error) reject(error);
@@ -134,6 +136,58 @@ export async function startUiServer(configPath: string, options: UiServerOptions
       });
     })
   };
+}
+
+/**
+ * Periodic in-process watchdog: every 5min, checks per-venue lastCycle from SQLite and emits a critical event
+ * when the loop has been silent past the stale threshold (30min). Without this, a loop wedged in error state
+ * (e.g. wallet-registry RPC timeout) silently sat for 6h before the user noticed — the user explicitly asked
+ * for a self-detection signal so the 2h scheduled health-check can escalate immediately, instead of waiting
+ * for next external poll.
+ */
+function startLoopStaleWatchdog(dataDir: string): NodeJS.Timeout {
+  const LOOP_STALE_THRESHOLD_MS = 30 * 60 * 1000;
+  const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
+  const lastAlertedAt = new Map<string, number>();
+  const tick = async (): Promise<void> => {
+    try {
+      const { StateStore } = await import('../store/sqlite.js');
+      const path = await import('node:path');
+      const dbPath = path.join(dataDir, 'state.sqlite');
+      const store = new StateStore(dbPath);
+      try {
+        const now = Date.now();
+        for (const venue of ['polymarket', 'predict'] as const) {
+          const lastCycle = store.recentEventTs(venue, 'ui.live.cycle.completed');
+          const loopStarted = store.recentEventTs(venue, 'ui.live.loop.started');
+          // Only alert when loop was started — if never started, there's nothing to be stale.
+          if (loopStarted === undefined) continue;
+          const stalenessRef = lastCycle ?? loopStarted;
+          const stalenessMs = now - stalenessRef;
+          if (stalenessMs <= LOOP_STALE_THRESHOLD_MS) {
+            lastAlertedAt.delete(venue);
+            continue;
+          }
+          // Re-alert at most once per stale window (every 30min) so we don't spam.
+          const lastAlertMs = lastAlertedAt.get(venue) ?? 0;
+          if (now - lastAlertMs < LOOP_STALE_THRESHOLD_MS) continue;
+          lastAlertedAt.set(venue, now);
+          store.recordEvent({
+            venue,
+            severity: 'error',
+            type: 'loop-stale-detected',
+            message: `${venue} 主循环已 ${Math.round(stalenessMs / 60000)} 分钟无 cycle（阈值 ${LOOP_STALE_THRESHOLD_MS / 60000} 分钟），可能进入 error 态或卡死`,
+            details: { lastCycleAt: lastCycle, loopStartedAt: loopStarted, stalenessMs, thresholdMs: LOOP_STALE_THRESHOLD_MS }
+          });
+        }
+      } finally {
+        store.close();
+      }
+    } catch { /* watchdog errors must never crash the UI */ }
+  };
+  const handle = setInterval(() => { void tick(); }, WATCHDOG_INTERVAL_MS);
+  handle.unref?.();
+  return handle;
 }
 
 async function handleRequest(

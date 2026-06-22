@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config/schema.js';
 import type { Market, OpenOrder, OrderIntent, Orderbook, Position, VenueName } from '../domain/types.js';
 import { rejectReason } from '../risk/reject-reasons.js';
+import { httpErrorDetails } from '../observability/http-error.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import type { StateStore } from '../store/sqlite.js';
 import { effectiveOrderbookTick } from '../strategy/rewards/common.js';
@@ -117,12 +118,6 @@ export class CashFillExitService {
       } catch (error) {
         failed += 1;
         const message = error instanceof Error ? error.message : String(error);
-        // Capture HttpError.status/body so we can see exactly why the venue (Predict / Polymarket CLOB) rejected an
-        // exit. Previously only the message was logged, so all we saw was "HTTP 400" with no body — making
-        // diagnostics impossible. With body recorded we can tell e.g. "insufficient balance" vs "price out of band".
-        const errorAny = error as { status?: unknown; body?: unknown };
-        const httpStatus = typeof errorAny?.status === 'number' ? errorAny.status : undefined;
-        const httpBody = errorAny?.body;
         this.store.recordEvent({
           venue: input.venue,
           severity: 'error',
@@ -131,8 +126,7 @@ export class CashFillExitService {
           details: {
             position: publicPosition(position),
             intent: publicIntent(plan.intent),
-            ...(httpStatus !== undefined ? { httpStatus } : {}),
-            ...(httpBody !== undefined ? { httpBody } : {}),
+            ...httpErrorDetails(error),
             reject: rejectReason('CASH_EXIT_FAILED', 'platform', 'cash-fill-exit')
           }
         });

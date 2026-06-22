@@ -6,7 +6,7 @@ import { accountRiskWindowStart } from '../risk/risk-window.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import type { StateStore } from '../store/sqlite.js';
 import { StrategyEngine } from '../strategy/strategy-engine.js';
-import { HttpError } from '../venues/http.js';
+import { httpErrorDetails } from '../observability/http-error.js';
 import type { VenueAdapter } from '../venues/types.js';
 import { AccountSyncService } from './account-sync.js';
 import { ExecutionRecorder } from './event-recorder.js';
@@ -462,14 +462,6 @@ export class SubmitService {
       details: { error: message, intent, reject }
     });
   }
-}
-
-function httpErrorDetails(error: unknown): { httpStatus?: number; httpBody?: unknown } {
-  if (!(error instanceof HttpError)) return {};
-  return {
-    httpStatus: error.status,
-    httpBody: error.body
-  };
 }
 
 function publicIntentPrice(intent: OrderIntent): Record<string, unknown> {

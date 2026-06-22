@@ -2,6 +2,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { AccountRiskDecision, AccountRiskSnapshot, Balance, Position, VenueName } from '../domain/types.js';
 import { dayStartTs, evaluateAccountRisk } from '../risk/account-risk.js';
 import { forensicLog } from '../observability/forensic-log.js';
+import { httpErrorDetails } from '../observability/http-error.js';
 import { accountRiskReasonCode, rejectReason } from '../risk/reject-reasons.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import type { StateStore } from '../store/sqlite.js';
@@ -56,7 +57,7 @@ export class AccountSyncService {
         severity: 'error',
         type: 'risk.account-snapshot.unavailable',
         message: '账户级成交/仓位/权益风控数据不可用，本轮不会新增订单',
-        details: { error: message, scope, reject: rejectReason('ACCOUNT_SNAPSHOT_UNAVAILABLE', 'account', scope) }
+        details: { error: message, scope, ...httpErrorDetails(error), reject: rejectReason('ACCOUNT_SNAPSHOT_UNAVAILABLE', 'account', scope) }
       });
       const decision = evaluateAccountRisk(input.venue, this.config, undefined);
       this.store.recordAccountRiskDecision({ ...decision, message: `${decision.message}：${message}` });

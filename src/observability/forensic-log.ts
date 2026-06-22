@@ -61,3 +61,25 @@ export function forensicLogEvent(input: { venue?: string; severity?: string; typ
 export function resetForensicLogForTest(): void {
   forensicDir = undefined;
 }
+
+/**
+ * Delete forensic JSONL files older than retentionMs (default 30d). Called from store retention at startup so the
+ * bot self-maintains disk; never throws. Files match `forensic-YYYY-MM-DD.jsonl`; anything else in the dir is left alone.
+ */
+export function pruneOldForensicFiles(dataDir: string, retentionMs: number, now = Date.now()): number {
+  let deleted = 0;
+  try {
+    const fs = require('node:fs') as typeof import('node:fs');
+    const dir = path.join(dataDir, 'forensic');
+    if (!fs.existsSync(dir)) return 0;
+    const cutoff = now - retentionMs;
+    for (const entry of fs.readdirSync(dir)) {
+      const match = /^forensic-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(entry);
+      if (!match) continue;
+      const dayMs = Date.parse(match[1] + 'T00:00:00Z');
+      if (!Number.isFinite(dayMs) || dayMs >= cutoff) continue;
+      try { fs.unlinkSync(path.join(dir, entry)); deleted += 1; } catch { /* ignore */ }
+    }
+  } catch { /* never throw */ }
+  return deleted;
+}

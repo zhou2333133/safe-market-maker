@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config/schema.js';
 import type { Market, NativeGasBalance, OpenOrder, Position, VenueName } from '../domain/types.js';
 import { rejectReason } from '../risk/reject-reasons.js';
+import { httpErrorDetails } from '../observability/http-error.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import type { StateStore } from '../store/sqlite.js';
 import { completeSetInventoryGroups } from '../strategy/paired-inventory.js';
@@ -161,6 +162,7 @@ export class LiquidationService {
             conditionId,
             amountUsd,
             groupKey: group.key,
+            ...httpErrorDetails(error),
             markets: group.markets.map(publicMarket),
             reject: rejectReason('MERGE_EXIT_FAILED', 'liquidation', 'merge-exit')
           }

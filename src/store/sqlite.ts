@@ -6,7 +6,13 @@ import { ObservabilityRepository, type CashFillCooldownEntry, type LocalCashExit
 import { OrderLedgerRepository, type RecentOrder } from './order-ledger-repository.js';
 import { RiskRepository, type AccountEquityPoint, type FillSummary } from './risk-repository.js';
 import { stateStoreSchemaSql } from './schema.js';
-import { configureForensicLog, forensicLogEvent } from '../observability/forensic-log.js';
+import { configureForensicLog, forensicLogEvent, pruneOldForensicFiles } from '../observability/forensic-log.js';
+
+// Retention windows: events/metrics in SQLite kept for 7d (hot tier, queried by UI + audit), forensic JSONL on disk
+// kept for 30d (cold archive, post-hoc complete record). Without retention the events table grows ~110k/day → 3.8GB
+// in two weeks; forensic at 60MB/day fills 1.8GB in 30d. Both auto-pruned at store-open so a long-running bot self-maintains.
+const SQLITE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const FORENSIC_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export class StateStore {
   private readonly db: Database.Database;
@@ -23,6 +29,24 @@ export class StateStore {
     this.risks = new RiskRepository(this.db, this.observability);
     this.db.pragma('journal_mode = WAL');
     this.migrate();
+    this.pruneRetention(path.dirname(dbPath));
+  }
+
+  /**
+   * Best-effort retention: drop events/metrics older than 7d from SQLite and any forensic JSONL files older than 30d.
+   * Runs once at constructor time. Wrapped in try/catch — retention must never block the bot from starting.
+   */
+  private pruneRetention(dataDir: string): void {
+    try {
+      const cutoff = Date.now() - SQLITE_RETENTION_MS;
+      const evDel = this.db.prepare('DELETE FROM events WHERE ts < ?').run(cutoff).changes;
+      const meDel = this.db.prepare('DELETE FROM metrics WHERE ts < ?').run(cutoff).changes;
+      if (evDel > 100000 || meDel > 100000) {
+        // Reclaim disk after large purge so the file actually shrinks.
+        this.db.exec('VACUUM');
+      }
+    } catch { /* retention failures must never block startup */ }
+    try { pruneOldForensicFiles(dataDir, FORENSIC_RETENTION_MS); } catch { /* same */ }
   }
 
   close(): void {
@@ -42,6 +66,15 @@ export class StateStore {
   }): void {
     this.observability.recordEvent(input);
     forensicLogEvent(input);
+  }
+
+  /** Most recent timestamp (epoch ms) for an event of the given (venue, type), or undefined when none. Used by the
+   * in-process stale-loop watchdog and the scheduled 2h health-check to detect wedged loops without scanning rows. */
+  recentEventTs(venue: VenueName | undefined, type: string): number | undefined {
+    const row = venue
+      ? this.db.prepare('SELECT ts FROM events WHERE venue=? AND type=? ORDER BY ts DESC LIMIT 1').get(venue, type) as { ts?: number } | undefined
+      : this.db.prepare('SELECT ts FROM events WHERE type=? ORDER BY ts DESC LIMIT 1').get(type) as { ts?: number } | undefined;
+    return row && Number.isFinite(row.ts) ? Number(row.ts) : undefined;
   }
 
   recordPlannedOrder(intent: OrderIntent, mode: ExecutionMode): void {
