@@ -23,8 +23,13 @@ const POLYMARKET_GAS_MIN_POL = 0.01;
 // separate (maxMarkets*2 / candidateLimit), so a larger pool here adds no orderbook cost.
 // Sized so the universe reaches past the crowded top-rate pools into low-competition ones — a small single-sided
 // order only clears the $1/day per-market payout floor where its share of the reward pool is meaningful.
-const POLYMARKET_REWARD_UNIVERSE_MAX = 240;
-const POLYMARKET_GAMMA_CONDITION_BATCH = 30;
+// Universe size: cover every market with a meaningful reward rate, not just the top ~240.
+// At 800 we comfortably include everything down to ~$10/day, which is well past the long tail
+// of markets a single-order bot can realistically earn in (~375 markets pay ≥$100/day total).
+const POLYMARKET_REWARD_UNIVERSE_MAX = 800;
+// Larger gamma batch = fewer round-trips when fetching the expanded universe.
+// 60 condition_ids ≈ 4 KB URL, well under nginx's 8 KB default.
+const POLYMARKET_GAMMA_CONDITION_BATCH = 60;
 const POLYMARKET_REWARDS_TTL_MS = 10 * 60 * 1000;
 export const POLYMARKET_PUSD = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
 export const POLYMARKET_EXCHANGE_V2 = '0xE111180000d2663C0091e4f400237545B87B996B';
