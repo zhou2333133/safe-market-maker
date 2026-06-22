@@ -123,12 +123,14 @@ export async function startUiServer(configPath: string, options: UiServerOptions
   singleton?.update({ host, port: resolvedPort, url });
   restoreLiveLoops(loaded.configPath, liveLoops);
   const watchdog = startLoopStaleWatchdog(loaded.dataDir);
+  const configWatcher = startConfigChangeWatcher(loaded.configPath, loaded.dataDir);
   return {
     url,
     host,
     port: resolvedPort,
     close: () => new Promise<void>((resolve, reject) => {
       clearInterval(watchdog);
+      configWatcher?.close();
       server.close((error) => {
         singleton?.release();
         if (error) reject(error);
@@ -145,6 +147,54 @@ export async function startUiServer(configPath: string, options: UiServerOptions
  * for a self-detection signal so the 2h scheduled health-check can escalate immediately, instead of waiting
  * for next external poll.
  */
+/**
+ * Watch config.yaml for changes (any save → emit `config.changed` event with file mtime, size and a snippet hash).
+ * This gives forensic reviews a clear "what changed between cycle X and Y" marker — earlier we had a hard-to-find
+ * relationship between user edits and behavior shifts because config changes left no trace in the events table.
+ */
+function startConfigChangeWatcher(configPath: string, dataDir: string): { close(): void } | undefined {
+  try {
+    const fs = require('node:fs') as typeof import('node:fs');
+    const path = require('node:path') as typeof import('node:path');
+    const crypto = require('node:crypto') as typeof import('node:crypto');
+    let debounceTimer: NodeJS.Timeout | undefined;
+    let lastHash = '';
+    const recordChange = (): void => {
+      try {
+        const buf = fs.readFileSync(configPath);
+        const hash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 16);
+        if (hash === lastHash) return;
+        const previousHash = lastHash;
+        lastHash = hash;
+        const stat = fs.statSync(configPath);
+        // Lazy import to avoid a startup-time DB open (the watcher only fires on real edits).
+        void (async (): Promise<void> => {
+          try {
+            const { StateStore } = await import('../store/sqlite.js');
+            const store = new StateStore(path.join(dataDir, 'state.sqlite'));
+            try {
+              store.recordEvent({
+                severity: 'warn',
+                type: 'config.changed',
+                message: `config.yaml 修改:hash=${hash} size=${stat.size}B mtime=${stat.mtime.toISOString()}`,
+                details: { hash, previousHash, size: stat.size, mtime: stat.mtime.toISOString(), path: configPath }
+              });
+            } finally { store.close(); }
+          } catch { /* never throw from watcher */ }
+        })();
+      } catch { /* file unreadable, skip */ }
+    };
+    // Seed lastHash so the first event is a real change, not just the watcher booting.
+    try { lastHash = require('node:crypto').createHash('sha256').update(require('node:fs').readFileSync(configPath)).digest('hex').slice(0, 16); } catch { /* ignore */ }
+    const watcher = fs.watch(configPath, () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      // Debounce: editors often save in multiple bursts.
+      debounceTimer = setTimeout(recordChange, 750);
+    });
+    return { close: () => { watcher.close(); if (debounceTimer) clearTimeout(debounceTimer); } };
+  } catch { return undefined; }
+}
+
 function startLoopStaleWatchdog(dataDir: string): NodeJS.Timeout {
   const LOOP_STALE_THRESHOLD_MS = 30 * 60 * 1000;
   const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;

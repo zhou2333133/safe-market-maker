@@ -514,6 +514,22 @@ export class ExecutionEngine {
       action: 'cancel-managed-and-protect'
     });
     if (shouldLog) {
+      // Snapshot the LIVE orderbook for each affected token at the moment of fill detection so post-hoc forensic
+      // review can answer "what did the book look like when this got eaten?" — without the snapshot, by the time
+      // anyone looks the depth has already moved and the cause-of-fill is unrecoverable.
+      const bookSnapshots: Record<string, unknown> = {};
+      for (const pos of unexpected.positions) {
+        try {
+          const cached = this.adapter.getCachedOrderbook?.(pos.tokenId);
+          if (cached) {
+            bookSnapshots[pos.tokenId] = {
+              receivedAt: cached.receivedAt,
+              bids: (cached.bids || []).slice(0, 10).map((b) => ({ price: b.price, size: b.size })),
+              asks: (cached.asks || []).slice(0, 10).map((a) => ({ price: a.price, size: a.size }))
+            };
+          }
+        } catch { /* best effort */ }
+      }
       this.store.recordEvent({
         venue,
         severity: 'error',
@@ -521,7 +537,8 @@ export class ExecutionEngine {
         message: '现金单边策略检测到持仓，疑似挂单被吃，撤销机器人受管挂单并按止损设置处理；清仓后继续扫描',
         details: {
           positions: unexpected.positions,
-          minPositionSizeToLiquidate: this.config.strategy.minPositionSizeToLiquidate
+          minPositionSizeToLiquidate: this.config.strategy.minPositionSizeToLiquidate,
+          orderbookSnapshots: bookSnapshots
         }
       });
     }
