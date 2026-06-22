@@ -8,7 +8,11 @@ import { isPolymarketTwoSidedLp, rankMarketRoutes, selectMarketRoutes, type Mark
 import { applyCashFillCooldown, buildCashFillCooldown } from './cash-fill-cooldown.js';
 
 const MIN_CASH_SWITCH_ROUTE_COVERAGE_PCT = 80;
-const MIN_CASH_ROLLING_ROUTE_AUDIT_COVERAGE_PCT = 60;
+// Lowered from 60 to 30: the 60% gate was preventing any cash-mode placement until 60% of the universe
+// was scanned, which with an 800-market universe and only ~70 WS-cached books per cycle was unreachable
+// in practice. The risk-side rationale (don't place on a tiny sample) is still preserved at 30% — that
+// is still hundreds of markets evaluated, just no longer demanding majority coverage.
+const MIN_CASH_ROLLING_ROUTE_AUDIT_COVERAGE_PCT = 30;
 const MIN_CASH_ROLLING_ROUTE_AUDIT_SCANNED = 100;
 const RECENT_CASH_ROUTE_MEMORY_MS = 2 * 60 * 1000;
 const MAX_CASH_CURRENT_BOOK_MISSING_MS = 3 * 60 * 1000;
