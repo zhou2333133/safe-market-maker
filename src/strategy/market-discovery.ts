@@ -303,9 +303,14 @@ function prioritizedMarkets(config: AppConfig, markets: Market[]): Market[] {
 function metadataPotentialScore(config: AppConfig, market: Market): number {
   const ppPerHour = market.rewards?.ppPerHour ?? rewardLevel(market) * 600;
   const ppScore = ppPerHour > 0 ? Math.log10(ppPerHour + 1) * 90 : 0;
-  // Polymarket exposes its reward pool as a daily USDC rate (not PP/hr); rank by it
-  // so the scan visits the highest official-reward markets first to find low-competition ones.
-  const dailyRateScore = market.rewards?.dailyRate ? Math.log10(market.rewards.dailyRate + 1) * 40 : 0;
+  // Polymarket exposes its reward pool as a daily USDC rate (not PP/hr); rank by it heavily
+  // so the scan visits the highest official-reward markets first. The previous weight (40) let
+  // wide-spread/high-level low-reward markets (Trump-Ahmed level=5 $100) outrank the actual top
+  // reward pools (Starmer/Hormuz/Fed/World Cup level=3 $1000-$3571) because levelScore (level*55)
+  // and the level*600 ppPerHour fallback gave level=5 a ~150 score advantage that drowned out a
+  // 10x reward difference at the old weight. Boost so daily rate dominates the metadata stage
+  // (live competition is then evaluated at the orderbook/route stage as before).
+  const dailyRateScore = market.rewards?.dailyRate ? Math.log10(market.rewards.dailyRate + 1) * 180 : 0;
   const levelScore = rewardLevel(market) * 55;
   const liquidityScore = config.strategy.entryMode === 'cash'
     ? Math.min(12, Math.log10(market.liquidityUsd + 1) * 3)
