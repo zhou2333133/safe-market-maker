@@ -45,8 +45,13 @@ export function evaluateAccountRisk(
   }
   // Belt-and-suspenders: a realized loss past the cap trips the stop even if the equity-based daily PnL looks fine
   // (e.g. a stale-high equity read masking it). The kill-switch must err toward halting, never silently pass a loss.
+  // EXCEPTION: skip when realizedPnlUsd was overwritten by the local cash-fill-exit FALLBACK estimate (warnings flag).
+  // That value is explicitly labeled "may be incomplete" and is meant for diagnostic visibility, not as a hard kill
+  // signal — it false-positively halted Predict at -$9.39 estimated when the equity actually showed only -$1.02.
+  // The equity-based dailyPnl check above (now using genuine venue equity) is the authoritative signal.
   const realizedLossUsd = finiteOrUndefined(snapshot.realizedPnlUsd);
-  if (realizedLossUsd !== undefined && realizedLossUsd <= -maxDailyLossUsd) {
+  const realizedIsFallbackEstimate = snapshot.warnings.some((w) => w.includes('Local cash-fill exit fallback estimated'));
+  if (realizedLossUsd !== undefined && !realizedIsFallbackEstimate && realizedLossUsd <= -maxDailyLossUsd) {
     return {
       ...baseDecision(venue, snapshot, maxDailyLossUsd),
       ok: false,
