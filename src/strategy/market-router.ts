@@ -117,7 +117,7 @@ export function rankMarketRoutes(
       return candidateSides.map((side) => {
         const quoteDecision = routeQuoteRiskDecision(config, venue, market, book, side, context.positions ?? []);
         const referenceQuote = quoteDecision.quote ?? routeReferenceQuote(config, venue, market, book, side, context.positions ?? []);
-        const cashScoringTarget = cashRouteScoringTarget(config, market, referenceQuote?.price);
+        const cashScoringTarget = cashRouteScoringTarget(config, market, referenceQuote?.price, book);
         const metrics = routeMetrics(config, venue, market, book, [side], {
           splitInventoryShares: inventorySharesByGroup.get(groupKey),
           splitGroupReferencePrices: splitReferencePricesByGroup.get(groupKey),
@@ -672,11 +672,17 @@ function routeMetrics(
 function cashRouteScoringTarget(
   config: AppConfig,
   market: Market,
-  quotePrice: number | undefined
+  quotePrice: number | undefined,
+  book?: Orderbook
 ): { targetOrderUsd: number; targetShares: number; targetOrderSource: 'reward-minimum-plus-one'; referencePrice: number } | undefined {
   if (isPairedEntryMode(config)) return undefined;
+  // For cash single-leg the bot quotes the CHEAP side at/near the best bid; if the route-stage couldn't generate a
+  // quote yet (book too thin for the reward-protection check), fall back to the LIVE best bid so the minRewardNotional
+  // estimate reflects the actual outcome's price. The previous 0.5 mid-fallback false-rejected the cheap side of any
+  // asymmetric market (Starmer No bid=0.12 was reported as needing $100.5 instead of the true $24).
+  const fallbackPrice = book ? (bestBidAsk(book).bestBid ?? 0.5) : 0.5;
   if (isPolymarketTwoSidedLp(config, market.venue)) {
-    const price = validPrice(quotePrice) ? quotePrice : 0.5;
+    const price = validPrice(quotePrice) ? quotePrice : fallbackPrice;
     const perLegUsd = polymarketLpPerLegUsd(config);
     return {
       targetOrderUsd: Number(perLegUsd.toFixed(4)),
@@ -685,7 +691,7 @@ function cashRouteScoringTarget(
       referencePrice: price
     };
   }
-  const referencePrice = validPrice(quotePrice) ? quotePrice : 0.5;
+  const referencePrice = validPrice(quotePrice) ? quotePrice : fallbackPrice;
   const targetShares = rewardTargetShares(config, market.rewards?.minShares);
   if (targetShares === undefined) return undefined;
   const rewardMinimumNotional = targetShares * referencePrice;
