@@ -1055,11 +1055,11 @@ describe('route service', () => {
       expect(selection.selected.map((candidate) => candidate.market.tokenId)).toEqual([backup.tokenId]);
       expect(selection.candidates.find((candidate) => candidate.market.tokenId === historicalFill.tokenId)).toMatchObject({
         tradable: false,
-        riskFlags: [expect.stringContaining('近 7 天已在该 市场 被吃单')]
+        riskFlags: [expect.stringContaining('近 24 小时已在该 市场 被吃单')]
       });
       expect(selection.candidates.find((candidate) => candidate.market.tokenId === sameMarketOtherOutcome.tokenId)).toMatchObject({
         tradable: false,
-        riskFlags: [expect.stringContaining('近 7 天已在该 市场 被吃单')]
+        riskFlags: [expect.stringContaining('近 24 小时已在该 市场 被吃单')]
       });
     });
   });

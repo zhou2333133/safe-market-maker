@@ -274,8 +274,8 @@ describe('route audit', () => {
     expect(audit.topByEfficiency.map((candidate) => candidate.tokenId)).toEqual([backup.tokenId]);
     expect(audit.selected.map((candidate) => candidate.tokenId)).toEqual([backup.tokenId]);
     expect(basket.map((candidate) => candidate.tokenId)).toEqual([backup.tokenId]);
-    expect(audit.rejectedTop.find((candidate) => candidate.tokenId === historicalFill.tokenId)?.riskFlags.join(' ')).toContain('近 7 天已在该 市场 被吃单');
-    expect(audit.rejectedTop.find((candidate) => candidate.tokenId === sameMarketOtherOutcome.tokenId)?.riskFlags.join(' ')).toContain('近 7 天已在该 市场 被吃单');
+    expect(audit.rejectedTop.find((candidate) => candidate.tokenId === historicalFill.tokenId)?.riskFlags.join(' ')).toContain('近 24 小时已在该 市场 被吃单');
+    expect(audit.rejectedTop.find((candidate) => candidate.tokenId === sameMarketOtherOutcome.tokenId)?.riskFlags.join(' ')).toContain('近 24 小时已在该 市场 被吃单');
   });
 
   it('keeps a fresh full-site audit execution basket while rolling cache coverage is partial', () => {

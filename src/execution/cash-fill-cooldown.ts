@@ -5,7 +5,9 @@ import { isCashMultiMarketEntry } from '../strategy/paired-inventory.js';
 import type { MarketRouteCandidate } from '../strategy/market-router.js';
 
 const CASH_FILL_SESSION_FALLBACK_LOOKBACK_MS = 6 * 60 * 60 * 1000;
-const CASH_FILL_HISTORY_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+// Shortened from 7 days to 1 day per user request: avoids re-entering today's eaten tokens but lets older
+// wounded tokens recover quickly — recent high-reward markets shouldn't be locked out for a week after one fill.
+const CASH_FILL_HISTORY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 export interface CashFillCooldown {
   session: Set<string>;
@@ -58,7 +60,7 @@ export function applyCashFillCooldown(
     ...candidate.riskFlags,
     blocked.window === 'session'
       ? `现金单边本轮实盘已在该 ${blocked.subject} 被吃单，手动重新开始新 session 后再评估`
-      : `现金单边近 7 天已在该 ${blocked.subject} 被吃单，暂不重新挂回高危盘口`
+      : `现金单边近 24 小时已在该 ${blocked.subject} 被吃单，暂不重新挂回高危盘口`
   ];
   return {
     ...candidate,
