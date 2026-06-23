@@ -295,6 +295,11 @@ export class PredictVenue implements VenueAdapter {
     });
   }
 
+  /** Seed WS cache with a REST-fetched book (cold-subscription rescue). */
+  primeBook(tokenId: string, book: Orderbook): void {
+    this.wsClient().primeBook(tokenId, book);
+  }
+
   wsWatchStats(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } {
     const stats = this.wsClient().stats();
     return { connected: stats.connected, watchedMarkets: stats.watchedMarkets, cachedOrderbooks: stats.cachedOrderbooks };

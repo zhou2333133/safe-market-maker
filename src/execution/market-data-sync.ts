@@ -138,22 +138,35 @@ export class MarketDataSyncService {
     // this only swaps the per-book data source (WS push cache first, REST on miss), so the same active set
     // costs far less REST and more markets stay affordable.
     const wsWatch = this.wsWatchEnabled(venue);
-    // Merge open-order markets into the WS watch set so markets with resting orders always stay subscribed
-    // even when the scan plan rotates them out. This keeps ws-report orderbook data real-time.
+    // Watch ONLY the bot's resting-order markets via WS — scan/discovery uses REST per cycle (existing path).
+    // Subscribing the full scan plan was the root cause of POLY's "watched=140 cached=4" dead-subscription
+    // cascade: most scan candidates are cold and never receive a WS snapshot, so they sit forever as dead
+    // entries. Now WS scope tracks the bot's actual stake. New tokens enter watch only when the bot places
+    // (see submit-service post-submit prime). Predict has always used this scope (watched=2 cached=2).
     const watchMarketsSet = openOrderMarkets && openOrderMarkets.length > 0
-      ? uniqueMarkets([...safeMarkets, ...openOrderMarkets.filter((market) => market.venue === venue)])
-      : safeMarkets;
-    if (wsWatch && watchMarketsSet.length > 0) this.adapter.watchMarkets?.(watchMarketsSet);
+      ? openOrderMarkets.filter((market) => market.venue === venue)
+      : [];
+    if (wsWatch) this.adapter.watchMarkets?.(watchMarketsSet);
     let restReads = 0;
     let wsServed = 0;
-    await mapWithConcurrency(safeMarkets, ORDERBOOK_SYNC_CONCURRENCY, async (market) => {
+    // Phase 4 cold-token prime: open-order markets that aren't covered by the scan plan (safeMarkets) get a
+    // dedicated REST fetch each cycle to guarantee fast-tick has a fresh book to verify protections against.
+    // Without this, a cold market gets a one-time prime at submit (Phase 3) but the cache slowly goes stale if
+    // Polymarket never pushes — and once stale the fast-retreat silently skips. Cheap: ~1 REST per active order
+    // per cycle, only for tokens the scan didn't already include.
+    const safeMarketTokenIds = new Set(safeMarkets.map((m) => m.tokenId));
+    const coldOpenOrderMarkets = (openOrderMarkets ?? []).filter((m) => m.venue === venue && !safeMarketTokenIds.has(m.tokenId));
+    const allMarketsToFetch = [...safeMarkets, ...coldOpenOrderMarkets];
+    await mapWithConcurrency(allMarketsToFetch, ORDERBOOK_SYNC_CONCURRENCY, async (market) => {
       try {
         const previousBook = cachedBooks.get(market.tokenId);
         let book = wsWatch ? this.adapter.getCachedOrderbook?.(market.tokenId) : undefined;
+        let restFetched = false;
         if (book) {
           wsServed += 1;
         } else {
           restReads += 1;
+          restFetched = true;
           // Under watch-all a cache miss goes STRAIGHT to REST (skip the blocking WS wait) so heavy ticks stay
           // fast; the subscription still warms the cache for the next cycle. Non-watch path keeps WS-then-REST.
           const fetchBook = wsWatch && this.adapter.getOrderbookRest
@@ -177,6 +190,11 @@ export class MarketDataSyncService {
         }
         books.set(market.tokenId, book);
         cachedBooks.set(market.tokenId, book);
+        // Phase 4: when REST fetched the book (not WS-served), prime the WS cache so the next fast-tick
+        // (which reads getCachedOrderbook only) finds it. WS push updates take over for subsequent ticks.
+        if (restFetched && book && this.adapter.primeBook) {
+          try { this.adapter.primeBook(market.tokenId, book); } catch { /* best effort */ }
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         failedTokenIds.add(market.tokenId);

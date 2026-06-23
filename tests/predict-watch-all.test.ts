@@ -106,13 +106,14 @@ describe('predict WS-cache-first orderbook reads (inside the unchanged scan + au
     try {
       const snapshot = await new MarketDataSyncService(config, venue, store).sync('predict');
 
-      // scanned markets got subscribed to the persistent WS
-      expect(venue.watchedTokenIds.sort()).toEqual(['cold-c', 'warm-a', 'warm-b']);
+      // New architecture (B+D): WS subscribes to OPEN-ORDER markets only — not the full scan plan.
+      // With no open orders in this scenario, watchedTokenIds is empty. Scan books come from REST.
+      expect(venue.watchedTokenIds).toEqual([]);
       // every scanned market ends up with a book (audit/routing see the same coverage as before)
       expect(snapshot.books.has('warm-a')).toBe(true);
       expect(snapshot.books.has('warm-b')).toBe(true);
       expect(snapshot.books.has('cold-c')).toBe(true);
-      // WS cache hits cost NO REST; only the cache miss hit REST
+      // WS cache hits still cost NO REST; only the cache miss hits REST
       expect(venue.restOrderbookCalls).not.toContain('warm-a');
       expect(venue.restOrderbookCalls).not.toContain('warm-b');
       expect(venue.restOrderbookCalls).toEqual(['cold-c']);

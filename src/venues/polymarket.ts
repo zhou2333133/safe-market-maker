@@ -271,12 +271,18 @@ export class PolymarketVenue implements VenueAdapter {
       .filter((market) => market.venue === 'polymarket' && market.tokenId)
       .map((market) => market.tokenId))];
     if (tokenIds.length === 0) return;
-    void this.wsClient().subscribeMarkets(tokenIds).catch(() => undefined);
+    void this.wsClient().reconcileMarkets(tokenIds).catch(() => undefined);
   }
 
   getCachedOrderbook(tokenId: string): Orderbook | undefined {
     if (!this.config.venues.polymarket.useWsOrderbook) return undefined;
     return this.wsClient().getCachedOrderbook(tokenId, POLY_WS_WATCH_CACHE_MAX_AGE_MS);
+  }
+
+  /** Seed WS cache with a REST-fetched book (cold-subscription rescue). */
+  primeBook(tokenId: string, book: Orderbook): void {
+    if (!this.config.venues.polymarket.useWsOrderbook) return;
+    this.wsClient().primeBook(tokenId, book);
   }
 
   /** REST-only orderbook fetch (skips the WS wait) for watch-all cache misses. */

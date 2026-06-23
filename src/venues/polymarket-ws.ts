@@ -75,23 +75,38 @@ export class PolymarketWsClient {
     });
   }
 
-  /** Batch-subscribe (add-only) many assets so their books arrive via push and can be read from cache for free. */
+  /** Add-only subscribe helper kept for callers that only want to ensure a token is watched (rare). */
   async subscribeMarkets(tokenIds: string[]): Promise<void> {
-    const ids = tokenIds.filter(Boolean);
-    if (ids.length === 0) return;
+    const merged = [...this.desiredAssets];
+    for (const id of tokenIds.filter(Boolean)) if (!this.desiredAssets.has(id)) merged.push(id);
+    await this.reconcileMarkets(merged);
+  }
+
+  /**
+   * Reconcile the WS subscription set to EXACTLY the requested tokens (add new, DROP stale, keep matches).
+   * Drop is essential: without it, watched accumulates every market the bot ever scanned and Polymarket's WS
+   * server silently stops snapshotting most of them — observed 136 dead subscriptions of 140 watched in
+   * production. Predict has used this reconcile pattern since day one; POLY now matches.
+   */
+  async reconcileMarkets(tokenIds: string[]): Promise<void> {
+    const desired = new Set(tokenIds.filter(Boolean));
     this.keepAlive = true;
+    // Drop subscriptions that are no longer desired so the server isn't holding stale state for us.
+    const stale = [...this.desiredAssets].filter((id) => !desired.has(id));
+    if (stale.length > 0) this.dropAssets(stale);
     let added = false;
-    for (const id of ids) {
+    for (const id of desired) {
       if (!this.desiredAssets.has(id)) {
         this.desiredAssets.add(id);
         added = true;
       }
     }
+    if (desired.size === 0) return;
     await this.ensureConnected();
     if (added || this.subscribedAssets.size < this.desiredAssets.size) {
       // Batch in chunks: one huge subscribe msg with hundreds of asset_ids sometimes causes Polymarket's WS
-      // server to silently drop most snapshots (only ~4 books cached out of 211 watched). Batching keeps each
-      // payload small enough that every subscription gets a snapshot.
+      // server to silently drop most snapshots. 50-per-batch keeps each payload small enough that every
+      // subscription gets a snapshot.
       const pending = [...this.desiredAssets].filter((id) => !this.subscribedAssets.has(id));
       const targets = pending.length > 0 ? pending : [...this.desiredAssets];
       const CHUNK = 50;
@@ -103,9 +118,33 @@ export class PolymarketWsClient {
     }
   }
 
+  /** Drop stale subscriptions: remove from desired/subscribed sets and clear any cached book. Polymarket's WS
+   * doesn't accept an unsubscribe message in the market channel, so the next full subscribe burst implicitly
+   * replaces the server's interest set. We at least clear OUR caches so a dropped token doesn't keep returning
+   * a stale book. */
+  private dropAssets(assetIds: string[]): void {
+    for (const id of assetIds) {
+      this.desiredAssets.delete(id);
+      this.subscribedAssets.delete(id);
+      this.books.delete(id);
+    }
+  }
+
   /** No-wait, no-REST cache read. Returns undefined when the book is missing, stale, or fails the sanity check. */
   getCachedOrderbook(tokenId: string, maxAgeMs: number): Orderbook | undefined {
     return this.cachedBook(tokenId, maxAgeMs);
+  }
+
+  /** Seed the WS cache with a REST-fetched book so the next fast-tick has data to verify protections against
+   * even when Polymarket's WS hasn't sent a snapshot yet for this asset (cold subscription). The seed lives
+   * the same way a real WS snapshot would; subsequent price_change events update it. Required by the post-
+   * submit prime hook and the periodic cold-token prime task. */
+  primeBook(tokenId: string, book: Orderbook): void {
+    const bids = new Map<number, number>();
+    const asks = new Map<number, number>();
+    for (const level of book.bids || []) if (level.price > 0 && level.price < 1 && level.size > 0) bids.set(level.price, level.size);
+    for (const level of book.asks || []) if (level.price > 0 && level.price < 1 && level.size > 0) asks.set(level.price, level.size);
+    this.books.set(tokenId, { bids, asks, receivedAt: book.receivedAt || Date.now() });
   }
 
   stats(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } {

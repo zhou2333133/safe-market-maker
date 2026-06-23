@@ -188,6 +188,14 @@ export class SubmitService {
       this.recordSubmitException(input.venue, input.intent, error);
       throw error;
     }
+    // Post-submit cache prime: when an order is freshly placed on a cold token (Polymarket's WS may never push
+    // a snapshot for an inactive market until someone trades it), the next fast-tick has NO book to verify the
+    // 3 protections against and silently skips the check — bot ends up resting unprotected. Add the token to WS
+    // watch + REST-fetch the book immediately so fast-tick has data on the very next cycle. Best-effort: a
+    // failure here doesn't roll back the submission.
+    if (result.externalId && result.status === 'OPEN') {
+      void this.primeBookForSubmittedOrder(input.venue, finalIntent).catch(() => undefined);
+    }
     if (result.externalId && result.status === 'OPEN') {
       if (input.verifyOpen === false) {
         this.store.recordOrderResult({
@@ -424,6 +432,22 @@ export class SubmitService {
 
   private rejectPlannedOrder(intent: OrderIntent, reason: string, details: unknown): void {
     this.store.markPlannedOrderRejected(intent.clientOrderId, reason, { intent, reject: details });
+  }
+
+  /** Best-effort: subscribe the newly-placed token to WS + REST-fetch its book and seed the cache so the next
+   * fast-tick can immediately verify the 3 protections. Without this prime the bot rests "naked" until the
+   * venue happens to push a snapshot — which for cold markets may be never. Errors are swallowed because the
+   * order is already in flight; protection on subsequent ticks is the goal, not blocking submission. */
+  private async primeBookForSubmittedOrder(venue: VenueName, intent: OrderIntent): Promise<void> {
+    try {
+      this.adapter.watchMarkets?.([intent.market]);
+    } catch { /* swallow */ }
+    try {
+      const fetchBook = this.adapter.getOrderbookRest?.bind(this.adapter) ?? this.adapter.getOrderbook?.bind(this.adapter);
+      if (!fetchBook) return;
+      const book = await fetchBook(intent.tokenId);
+      this.adapter.primeBook?.(intent.tokenId, book);
+    } catch { /* REST/prime failure: next cycle's market-data-sync will re-attempt */ }
   }
 
   private recordSubmitBlocked(venue: VenueName, intent: OrderIntent, submitRisk: AccountRiskDecision): void {

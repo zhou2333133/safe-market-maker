@@ -515,8 +515,9 @@ export class ExecutionEngine {
     });
     if (shouldLog) {
       // Snapshot the LIVE orderbook for each affected token at the moment of fill detection so post-hoc forensic
-      // review can answer "what did the book look like when this got eaten?" — without the snapshot, by the time
-      // anyone looks the depth has already moved and the cause-of-fill is unrecoverable.
+      // review can answer "what did the book look like when this got eaten?". WS cache only (no REST fallback —
+      // the await blocked exit-flow timing in tests, and "missing snapshot" is itself diagnostic: it means WS
+      // never had this book, which is exactly the symptom we now cancel for after 30s of naked rest).
       const bookSnapshots: Record<string, unknown> = {};
       for (const pos of unexpected.positions) {
         try {

@@ -76,8 +76,21 @@ export class PredictWsClient {
 
   /** No-wait, no-REST cache read. Returns undefined when the book is missing or older than maxAgeMs. */
   getCachedOrderbook(marketId: string, tokenId: string, maxAgeMs: number, options: { complement?: boolean; complementTickSize?: number } = {}): Orderbook | undefined {
-    return this.cachedBook(marketId, tokenId, maxAgeMs, options);
+    const ws = this.cachedBook(marketId, tokenId, maxAgeMs, options);
+    if (ws) return ws;
+    const primed = this.primedBooks.get(tokenId);
+    if (!primed || Date.now() - primed.receivedAt > maxAgeMs) return undefined;
+    return primed;
   }
+
+  /** Seed the cache with a REST-fetched book so the next read has data even when WS hasn't pushed for this
+   * market yet (cold subscription). The seed coexists with WS pushes; whichever is fresher wins via maxAgeMs
+   * on read. Used by the post-submit prime hook and the cold-token prime task. */
+  primeBook(tokenId: string, book: Orderbook): void {
+    this.primedBooks.set(tokenId, { ...book, receivedAt: book.receivedAt || Date.now() });
+  }
+
+  private primedBooks: Map<string, Orderbook> = new Map();
 
   watchedMarketCount(): number {
     let count = 0;

@@ -71,6 +71,9 @@ export interface VenueAdapter {
   getCachedOrderbook?(tokenId: string): Orderbook | undefined;
   /** REST-only orderbook fetch that skips the blocking WS wait — used for watch-all cache misses to keep cycles fast. */
   getOrderbookRest?(tokenId: string): Promise<Orderbook>;
+  /** Seed the WS push-cache with a REST-fetched book so cold-subscription tokens have data to verify protections
+   * against on the very next fast-tick (without waiting for the venue to send a snapshot we may never get). */
+  primeBook?(tokenId: string, book: Orderbook): void;
   /** Diagnostics for the persistent watch-all socket. */
   wsWatchStats?(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } | undefined;
   getBalances(address: string, signer?: SignerProvider): Promise<Balance[]>;
