@@ -454,25 +454,36 @@ export function rewardQuoteProtection(config: AppConfig, side: OrderSide, price:
         supportGapCents: Number(supportGapCents.toFixed(4))
       };
     }
-    if (side === 'BUY' && (config.strategy.cashRequireExitLiquidity ?? false)) {
-      // Exit liquidity (back support): the bids immediately BELOW the resting BUY — within a few TICKS — must absorb
-      // the full order size, so a fill can be sold out at ~1-2 ticks instead of stuck single-leg inventory. The window
-      // is tick-based (not the loss %): liquidity further than maxExitTicks is a big-loss exit and does NOT count.
-      const exitTick = market ? effectiveOrderbookTick(market, book) : effectiveOrderbookTick({ tickSize: 0.01 }, book);
-      const maxExitTicks = Math.max(1, config.strategy.cashExitLiquidityMaxTicks ?? 2);
-      const exitFloor = price - maxExitTicks * exitTick;
-      const exitDepthUsd = bids
-        .filter((level) => level.price < price - 1e-9 && level.price >= exitFloor - 1e-9)
-        .reduce((sum, level) => sum + level.price * level.size, 0);
-      const requiredExitUsd = Math.max(0, config.risk.orderSizeUsd);
-      if (exitDepthUsd + 1e-9 < requiredExitUsd) {
-        return {
-          ok: false,
-          reason: `后方退出流动性 ${formatUsd(exitDepthUsd)}(仅近 ${maxExitTicks} 跳内)不足以吃下挂单 ${formatUsd(requiredExitUsd)}(被吃会卡成单腿)`,
-          depthUsd: Number(depthUsd.toFixed(4)),
-          minDepthUsd,
-          supportGapCents: Number(supportGapCents.toFixed(4))
-        };
+    if (side === 'BUY') {
+      // Exit liquidity (rear support) — user's core rule #3: "support depth in the 1¢ window directly below my
+      // placement must cover my order size." Two equivalent modes:
+      //  (a) CENT-based window via cashSupportWindowCents (preferred, venue-independent): bids within X¢
+      //      below placement must cover order size.
+      //  (b) TICK-based window via cashRequireExitLiquidity + cashExitLiquidityMaxTicks (legacy): bids within
+      //      N ticks below placement must cover order size.
+      // Either mode can trigger rejection; both compute the same kind of "can I sell within close range?"
+      const cents = Math.max(0, config.strategy.cashSupportWindowCents ?? 0);
+      const tickGateOn = config.strategy.cashRequireExitLiquidity ?? false;
+      if (cents > 0 || tickGateOn) {
+        const exitTick = market ? effectiveOrderbookTick(market, book) : effectiveOrderbookTick({ tickSize: 0.01 }, book);
+        const maxExitTicks = Math.max(1, config.strategy.cashExitLiquidityMaxTicks ?? 2);
+        const tickFloor = tickGateOn ? price - maxExitTicks * exitTick : -Infinity;
+        const centFloor = cents > 0 ? price - cents / 100 : -Infinity;
+        const exitFloor = Math.max(tickFloor, centFloor);
+        const exitDepthUsd = bids
+          .filter((level) => level.price < price - 1e-9 && level.price >= exitFloor - 1e-9)
+          .reduce((sum, level) => sum + level.price * level.size, 0);
+        const requiredExitUsd = Math.max(0, config.risk.orderSizeUsd);
+        if (exitDepthUsd + 1e-9 < requiredExitUsd) {
+          const windowLabel = cents > 0 ? `${cents}¢ 窗口` : `${maxExitTicks} 跳`;
+          return {
+            ok: false,
+            reason: `后方退出流动性 ${formatUsd(exitDepthUsd)}(仅近 ${windowLabel}内)不足以吃下挂单 ${formatUsd(requiredExitUsd)}(被吃会卡成单腿)`,
+            depthUsd: Number(depthUsd.toFixed(4)),
+            minDepthUsd,
+            supportGapCents: Number(supportGapCents.toFixed(4))
+          };
+        }
       }
     }
     return { ok: true, reason: '现金单边测试单前方保护深度、后方退出流动性和支撑价差通过', depthUsd: Number(depthUsd.toFixed(4)), minDepthUsd };

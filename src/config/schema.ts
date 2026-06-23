@@ -79,6 +79,11 @@ const strategySchema = z.object({
   // Max ticks BELOW the resting BUY that count as exit liquidity (close-behind protection). Liquidity further than
   // this is a big-loss exit and does NOT count as protection. ~2 ticks ≈ unwind within 1-2 ticks. Tune freely.
   cashExitLiquidityMaxTicks: z.number().positive().default(2),
+  // CENT-based support window (user's core rule #3): bids within this many cents BELOW the resting BUY must
+  // collectively cover the full order size, regardless of venue tick. Same 1¢ rule works for 1¢ tick markets
+  // (need 19¢ bid for 20¢ placement) and 0.1¢ tick markets (need cumulative depth in 21.1¢-22.1¢ for 22.1¢
+  // placement). 0 = disabled (default for backward compat); set to 1 per venue to enable the strict rule.
+  cashSupportWindowCents: z.number().nonnegative().default(0),
   cancelOutsideReward: z.boolean().default(true),
   onFillAction: z.enum(['hold', 'sellAllAtMarket']).default('hold'),
   cashOnFillAction: z.enum(['hold', 'sellWithinLossCap']).default('hold'),
