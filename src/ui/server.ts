@@ -210,9 +210,14 @@ function startLoopStaleWatchdog(dataDir: string): NodeJS.Timeout {
         for (const venue of ['polymarket', 'predict'] as const) {
           const lastCycle = store.recentEventTs(venue, 'ui.live.cycle.completed');
           const loopStarted = store.recentEventTs(venue, 'ui.live.loop.started');
-          // Only alert when loop was started — if never started, there's nothing to be stale.
-          if (loopStarted === undefined) continue;
-          const stalenessRef = lastCycle ?? loopStarted;
+          const autoResumed = store.recentEventTs(venue, 'ui.live.auto-resumed');
+          // Loop is considered "running" if either an explicit start OR an auto-resume happened. Earlier this only
+          // checked loop.started, which silently skipped Predict (whose lifecycle is dominated by auto-resume across
+          // restarts) — meaning Predict's 2.5h hang on cycle 3354 went undetected. lastCycle is the freshest signal
+          // when present; otherwise fall back to whichever activation marker exists.
+          const loopActivated = lastCycle ?? loopStarted ?? autoResumed;
+          if (loopActivated === undefined) continue;
+          const stalenessRef = lastCycle ?? loopActivated;
           const stalenessMs = now - stalenessRef;
           if (stalenessMs <= LOOP_STALE_THRESHOLD_MS) {
             lastAlertedAt.delete(venue);
