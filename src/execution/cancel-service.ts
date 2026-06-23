@@ -148,6 +148,23 @@ export class CancelService {
       const book = books.get(order.tokenId);
       // Fast retreat: re-validate the front cushion on the live (fresh) book; if it eroded below the retreat floor the
       // placement protection has been pulled/swept and we're about to be filled — cancel immediately (fast ticks too).
+      // SAFETY FIRST: a cash-protected BUY that's been resting > 30s WITHOUT a fresh book is naked — neither
+      // fast-retreat nor route checks ever verified its 3 protections. Cancel immediately. This closes the
+      // gap that ate POLY @ 0.437 (token 3799…, 184s rest with empty WS cache, zero protection checks).
+      // Short-term (<30s) missing/stale books still flow through the existing strike-based tolerance below so
+      // brief WS bursts don't churn the order — that path's behavior is unchanged.
+      const orderAgeMs = order.placedAt ? Date.now() - order.placedAt : 0;
+      const longNakedRest = orderAgeMs > 30_000;
+      if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
+        cancelIds.add(order.externalId);
+        cancelReasons.push({
+          orderId: order.externalId,
+          tokenId: order.tokenId,
+          side: order.side,
+          reason: `保护盘口不可用(${!book ? '无缓存' : '陈旧 ' + Math.max(0, Date.now() - book.receivedAt) + 'ms'})，无法验证 3 道保护，立即撤单避免裸奔`
+        });
+        continue;
+      }
       const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
       if (retreat) {
         cancelIds.add(order.externalId);
