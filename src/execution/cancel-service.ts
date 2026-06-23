@@ -151,11 +151,21 @@ export class CancelService {
       const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
       if (retreat) {
         cancelIds.add(order.externalId);
+        // Reason text reflects WHICH protection eroded — front cushion, rear support, or both — so post-hoc forensic
+        // review can tell whether the eat-vector was "front pulled" vs "support yanked behind me".
+        const reasons: string[] = [];
+        if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
+          reasons.push(`前方保护深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
+        }
+        if (retreat.supportShortfall) {
+          const s = retreat.supportShortfall;
+          reasons.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)}(${s.windowCents}¢ 窗口内)< $${s.requiredUsd}`);
+        }
         cancelReasons.push({
           orderId: order.externalId,
           tokenId: order.tokenId,
           side: order.side,
-          reason: `前方保护深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}，快撤避免被吃`
+          reason: `${reasons.join(' + ')}，快撤避免被吃`
         });
         continue;
       }
@@ -395,10 +405,13 @@ function isStaleBook(config: AppConfig, book: Orderbook): boolean {
 }
 
 /**
- * Fast-retreat decision: re-validate the LIVE front cushion of a resting PL cash BUY. Returns the retreat detail when
- * the front protection ($ of bids ahead of our price) has eroded below polymarketRetreatFrontDepthUsd on a FRESH book
- * — meaning the placement protection was pulled/swept and a taker is about to reach us — else null. A stale book is
- * never trusted to retreat (could be a false trigger). A 0 floor disables the feature.
+ * Fast-retreat decision: re-validate the LIVE protections of a resting cash BUY on a FRESH book — currently checks
+ * BOTH (a) front cushion eroded below polymarketRetreatFrontDepthUsd AND (b) the rear-support 1¢ window can no longer
+ * absorb the order size. Either trigger means the placement protections have been undermined and a taker is about to
+ * reach us OR an eaten fill could not be exited at ≤1¢ slippage. Stale books are never trusted to retreat.
+ *
+ * Both checks are venue-independent (POLY uses polymarketRetreatFrontDepthUsd + cashSupportWindowCents in its
+ * strategy block; Predict uses its OWN values in predictParams.strategy — modules stay fully independent).
  */
 export function shouldRetreatThinFront(
   config: AppConfig,
@@ -406,15 +419,37 @@ export function shouldRetreatThinFront(
   order: OpenOrder,
   market: Market | undefined,
   book: Orderbook | undefined
-): { frontDepthUsd: number; floorUsd: number } | null {
-  const floorUsd = config.strategy.polymarketRetreatFrontDepthUsd ?? 0;
-  if (floorUsd <= 0) return null;
-  if (venue !== 'polymarket' || config.strategy.entryMode !== 'cash' || isPairedEntryMode(config)) return null;
-  if (order.side !== 'BUY' || !market || market.venue !== 'polymarket' || !book) return null;
+): { frontDepthUsd: number; floorUsd: number; supportShortfall?: { exitDepthUsd: number; requiredUsd: number; windowCents: number } } | null {
+  if (config.strategy.entryMode !== 'cash' || isPairedEntryMode(config)) return null;
+  if (order.side !== 'BUY' || !market || !book || market.venue !== venue) return null;
   if (isStaleBook(config, book)) return null;
-  const frontDepthUsd = frontProtectionDepthUsd(book, order.side, order.price);
-  if (frontDepthUsd + 1e-9 >= floorUsd) return null;
-  return { frontDepthUsd, floorUsd };
+  // (a) Front-cushion retreat. Per-venue knob (modules independent): POLY uses polymarketRetreatFrontDepthUsd,
+  // Predict uses predictFrontDepthUsd (no separate retreat knob — match placement floor = no hysteresis).
+  const floorUsd = venue === 'polymarket'
+    ? (config.strategy.polymarketRetreatFrontDepthUsd ?? 0)
+    : venue === 'predict'
+      ? (config.strategy.predictFrontDepthUsd ?? 0)
+      : 0;
+  const frontDepthUsd = floorUsd > 0 ? frontProtectionDepthUsd(book, order.side, order.price) : Number.POSITIVE_INFINITY;
+  const frontFailed = floorUsd > 0 && frontDepthUsd + 1e-9 < floorUsd;
+  // (b) Rear-support window retreat (new). Cent-based window directly below the resting BUY must still absorb the
+  // order size; if the support was pulled while we rested, the next fill becomes a stuck single-leg position. This
+  // closes the gap the user observed: cent-based support was only checked at placement, so when level-2 support got
+  // pulled mid-rest the bot got eaten anyway. Predict uses the SAME knob but in its own strategy block — independent.
+  const windowCents = Math.max(0, config.strategy.cashSupportWindowCents ?? 0);
+  const requiredUsd = Math.max(0, config.risk.orderSizeUsd);
+  let supportShortfall: { exitDepthUsd: number; requiredUsd: number; windowCents: number } | undefined;
+  if (windowCents > 0 && requiredUsd > 0) {
+    const floor = order.price - windowCents / 100;
+    const exitDepthUsd = (book.bids ?? [])
+      .filter((level) => level.price < order.price - 1e-9 && level.price >= floor - 1e-9)
+      .reduce((sum, level) => sum + level.price * level.size, 0);
+    if (exitDepthUsd + 1e-9 < requiredUsd) {
+      supportShortfall = { exitDepthUsd: Number(exitDepthUsd.toFixed(4)), requiredUsd, windowCents };
+    }
+  }
+  if (!frontFailed && !supportShortfall) return null;
+  return { frontDepthUsd, floorUsd, ...(supportShortfall ? { supportShortfall } : {}) };
 }
 
 function cashMaintenanceBookUnavailableDecision(
