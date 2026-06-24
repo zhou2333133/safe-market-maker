@@ -46,6 +46,11 @@ const ORDERBOOK_SCAN_RATE_BUDGET_RATIO = 0.5;
 // comfortably under the 45s guard yet covers the ~250-market universe in far fewer 5-min passes, so the bot reaches
 // the 60% gate and picks from a much larger candidate pool sooner (was the "only 2 tradable" warm-up complaint).
 const FULL_ROUTE_SCAN_MAX_ORDERBOOKS = 70;
+// Polymarket: one POST /books REST call returns ~20 orderbooks. That changes the unit of the "rate budget" from
+// books-per-cycle to (books-per-cycle × books-per-request), so the scan plan can request many more markets without
+// touching the underlying REST request rate. Predict has no batch endpoint and keeps the 1-book-per-request budget.
+const POLYMARKET_BOOKS_PER_REQUEST = 20;
+const POLYMARKET_FULL_ROUTE_SCAN_MAX_ORDERBOOKS = FULL_ROUTE_SCAN_MAX_ORDERBOOKS * POLYMARKET_BOOKS_PER_REQUEST;
 
 export function discoverRoutableMarkets(config: AppConfig, venue: VenueName, markets: Market[]): Market[] {
   const sameVenue = markets.filter((market) => market.venue === venue);
@@ -72,16 +77,16 @@ export function planMarketOrderbookScan(
   const skippedUnavailableCooldown = safe.length - candidateSafe.length;
   if (options.forceFullScan) {
     const nonActiveSafe = candidateSafe.filter((market) => !activeTokens.has(market.tokenId));
-    const normalRateBudget = orderbookScanRateBudget(config, active.length);
+    const normalRateBudget = orderbookScanRateBudget(config, active.length, venue);
     const baseNonActiveBudget = Math.max(0, normalRateBudget - active.length);
     // Cash single-sided gates placement on a rolling route-audit reaching ≥60% universe coverage. The tiny per-cycle
     // budget can never get there, so the periodic full scan fetches a large bounded slice in one pass (still well under
     // the per-minute rate limit) to let the loop self-start placing without a manual audit. Other modes (split/paired
     // two-sided LP) don't use the coverage gate, so they keep the normal rotating budget.
-    // Leave room for the active orders so active + scan stays ~FULL_ROUTE_SCAN_MAX_ORDERBOOKS total — at high
+    // Leave room for the active orders so active + scan stays ~fullRouteScanMaxOrderbooks total — at high
     // maxMarkets the active set already eats the budget, so the extra scan shrinks rather than blowing the cycle.
     const fullScanBudget = config.strategy.entryMode === 'cash'
-      ? Math.min(nonActiveSafe.length, Math.max(baseNonActiveBudget, FULL_ROUTE_SCAN_MAX_ORDERBOOKS - active.length))
+      ? Math.min(nonActiveSafe.length, Math.max(baseNonActiveBudget, fullRouteScanMaxOrderbooks(venue) - active.length))
       : baseNonActiveBudget;
     const selectedNonActive = rotatingExploreMarkets(config, venue, prioritizedMarkets(config, nonActiveSafe), fullScanBudget, 'full');
     const selected = uniqueMarkets([...active, ...selectedNonActive]);
@@ -120,7 +125,7 @@ export function planMarketOrderbookScan(
       ? config.risk.maxMarkets
       : Math.min(Math.ceil(requestedHotBudget / 3), Math.max(maxTokensPerMarket, config.risk.maxMarkets * maxTokensPerMarket))
   );
-  const rateBudget = orderbookScanRateBudget(config, active.length);
+  const rateBudget = orderbookScanRateBudget(config, active.length, venue);
   const nonActiveBudget = Math.max(0, rateBudget - active.length);
   const constrainedSlot = constrainedNonActiveSlot(config, venue, nonActiveBudget, maxTokensPerMarket);
   const exploreBudget = constrainedSlot === 'explore'
@@ -216,14 +221,21 @@ function selectGroupedMarkets(config: AppConfig, markets: Market[], budget: numb
   return flattenGroups(groups, budget).markets;
 }
 
-function orderbookScanRateBudget(config: AppConfig, activeCount: number): number {
+function orderbookScanRateBudget(config: AppConfig, activeCount: number, venue?: VenueName): number {
   const refreshMs = Math.max(1000, config.strategy.quoteRefreshMs ?? 2000);
   const requestsPerCycle = Math.max(1, Math.floor((PREDICT_DEFAULT_API_RATE_LIMIT_PER_MINUTE * refreshMs) / 60000));
-  const plannedOrderbookBudget = Math.max(1, Math.floor(requestsPerCycle * ORDERBOOK_SCAN_RATE_BUDGET_RATIO));
+  // Polymarket: one REST request returns POLYMARKET_BOOKS_PER_REQUEST books via POST /books, so the books budget
+  // is many-times the request budget. Predict has no such endpoint and stays at 1-book-per-request.
+  const booksPerRequest = venue === 'polymarket' ? POLYMARKET_BOOKS_PER_REQUEST : 1;
+  const plannedOrderbookBudget = Math.max(1, Math.floor(requestsPerCycle * ORDERBOOK_SCAN_RATE_BUDGET_RATIO * booksPerRequest));
   if (config.strategy.entryMode === 'cash') {
     return Math.max(plannedOrderbookBudget, activeCount + cashExploreSlots(config));
   }
   return Math.max(activeCount, plannedOrderbookBudget);
+}
+
+function fullRouteScanMaxOrderbooks(venue?: VenueName): number {
+  return venue === 'polymarket' ? POLYMARKET_FULL_ROUTE_SCAN_MAX_ORDERBOOKS : FULL_ROUTE_SCAN_MAX_ORDERBOOKS;
 }
 
 function cashExploreSlots(config: AppConfig): number {

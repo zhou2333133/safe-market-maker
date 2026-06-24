@@ -157,6 +157,36 @@ export class MarketDataSyncService {
     const safeMarketTokenIds = new Set(safeMarkets.map((m) => m.tokenId));
     const coldOpenOrderMarkets = (openOrderMarkets ?? []).filter((m) => m.venue === venue && !safeMarketTokenIds.has(m.tokenId));
     const allMarketsToFetch = [...safeMarkets, ...coldOpenOrderMarkets];
+    // Try one bulk POST /books call up front for the markets the WS cache doesn't cover. Single-fetch fallback in
+    // the per-market loop handles whatever the bulk call didn't return (network error, partial response, unknown
+    // tokens). Only the venue that exposes getOrderbooksBatch (currently Polymarket) takes this path; Predict's
+    // adapter leaves it undefined and the loop runs exactly as before, single-fetch per market.
+    const bulkBooks = new Map<string, Orderbook>();
+    if (typeof this.adapter.getOrderbooksBatch === 'function' && allMarketsToFetch.length > 0) {
+      const tokensNeedingFetch = allMarketsToFetch
+        .filter((market) => !(wsWatch ? this.adapter.getCachedOrderbook?.(market.tokenId) : undefined))
+        .map((market) => market.tokenId);
+      if (tokensNeedingFetch.length > 0) {
+        try {
+          const batch = await withTimeout(
+            this.adapter.getOrderbooksBatch(tokensNeedingFetch),
+            ORDERBOOK_SYNC_TIMEOUT_MS,
+            `bulk orderbooks (${tokensNeedingFetch.length} tokens)`
+          );
+          for (const [id, book] of batch) bulkBooks.set(id, book);
+        } catch (error) {
+          // Bulk failure is non-fatal: the loop below falls back to single-fetch per market. Record once so an
+          // operator notices if the batch endpoint keeps failing (and gets to flip useWsOrderbook / debug).
+          this.store.recordEvent({
+            venue,
+            severity: 'info',
+            type: 'orderbook.bulk-fallback',
+            message: `批量盘口接口失败，本轮回退到单本拉取 (${tokensNeedingFetch.length} markets)`,
+            details: { error: error instanceof Error ? error.message : String(error), tokenCount: tokensNeedingFetch.length }
+          });
+        }
+      }
+    }
     await mapWithConcurrency(allMarketsToFetch, ORDERBOOK_SYNC_CONCURRENCY, async (market) => {
       try {
         const previousBook = cachedBooks.get(market.tokenId);
@@ -164,6 +194,12 @@ export class MarketDataSyncService {
         let restFetched = false;
         if (book) {
           wsServed += 1;
+        } else if (bulkBooks.has(market.tokenId)) {
+          // Bulk /books already fetched this one — counts as a REST read (it WAS a REST round-trip, just shared)
+          // and primes the WS cache identically to a single-fetch result.
+          book = bulkBooks.get(market.tokenId)!;
+          restReads += 1;
+          restFetched = true;
         } else {
           restReads += 1;
           restFetched = true;

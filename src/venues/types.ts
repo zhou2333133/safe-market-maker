@@ -76,6 +76,12 @@ export interface VenueAdapter {
   primeBook?(tokenId: string, book: Orderbook): void;
   /** Diagnostics for the persistent watch-all socket. */
   wsWatchStats?(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } | undefined;
+  /** OPTIONAL: bulk fetch orderbooks in one HTTP round-trip (Polymarket's POST /books). Returns a Map keyed by
+   * tokenId — tokens for which the venue returned no usable book are simply absent from the Map. Should NOT throw
+   * for per-token failures; only throw if the whole call fails (HTTP error, network down). Callers that get an
+   * empty / partial Map for some tokens MUST fall back to single getOrderbook / getOrderbookRest for the missing
+   * ones, so the scan never degrades silently. Predict has no equivalent endpoint and leaves this undefined. */
+  getOrderbooksBatch?(tokenIds: string[]): Promise<Map<string, Orderbook>>;
   getBalances(address: string, signer?: SignerProvider): Promise<Balance[]>;
   getPositions(address: string): Promise<Position[]>;
   getOpenOrders(address: string): Promise<OpenOrder[]>;

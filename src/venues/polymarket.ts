@@ -34,6 +34,9 @@ const POLYMARKET_REWARDS_TTL_MS = 10 * 60 * 1000;
 // Safety cap on /sampling-simplified-markets pagination. ~7 pages cover the entire reward universe (~7000 markets);
 // keeping a headroom of 12 protects against runaway looping if the API ever stops returning next_cursor=LTE=.
 const POLYMARKET_SAMPLING_MAX_PAGES = 12;
+// Bulk orderbook fetch batch size (POST /books). Empirically reliable up to ~20-30; 20 keeps a comfortable margin
+// against per-request body limits and 403 spikes seen with larger payloads.
+const POLYMARKET_BOOKS_BATCH_SIZE = 20;
 export const POLYMARKET_PUSD = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
 export const POLYMARKET_EXCHANGE_V2 = '0xE111180000d2663C0091e4f400237545B87B996B';
 export const POLYMARKET_NEG_RISK_EXCHANGE_V2 = '0xe2222d279d744050d28e00520010520000310F59';
@@ -290,6 +293,46 @@ export class PolymarketVenue implements VenueAdapter {
     const url = new URL(`${this.config.venues.polymarket.clobUrl.replace(/\/+$/, '')}/book`);
     url.searchParams.set('token_id', tokenId);
     return buildOrderbook(this.name, tokenId, await httpJson<any>(url.toString()));
+  }
+
+  /**
+   * Bulk orderbook fetch via Polymarket's POST /books. Returns a Map keyed by tokenId; missing tokens (no usable
+   * book in the response) are simply absent from the Map so the caller can fall back to single /book for them.
+   *
+   * Why this exists: the scan loop without this is bottlenecked at ~5 single /book calls/sec on a 941-market
+   * universe, never reaching the route-audit coverage gate. Batched /books returns dozens of books per round-trip
+   * and lifts the universe coverage from ~18% (stuck) to >30% within minutes.
+   *
+   * Per-request batch is bounded by POLYMARKET_BOOKS_BATCH_SIZE to stay well under Polymarket's per-request body
+   * limit (empirically ~20-30 tokens is reliably accepted). Network / HTTP / parse failure throws — the caller
+   * MUST catch and fall back to single-fetch so a venue outage never silently drops markets from scan coverage.
+   */
+  async getOrderbooksBatch(tokenIds: string[]): Promise<Map<string, Orderbook>> {
+    const unique = [...new Set(tokenIds.filter(Boolean))];
+    const results = new Map<string, Orderbook>();
+    if (unique.length === 0) return results;
+    const url = `${this.config.venues.polymarket.clobUrl.replace(/\/+$/, '')}/books`;
+    for (let i = 0; i < unique.length; i += POLYMARKET_BOOKS_BATCH_SIZE) {
+      const batch = unique.slice(i, i + POLYMARKET_BOOKS_BATCH_SIZE);
+      const body = JSON.stringify(batch.map((tokenId) => ({ token_id: tokenId })));
+      const payload = await httpJson<any>(url, { method: 'POST', body });
+      // /books returns either a top-level array of book objects, OR an object with a `books`/`data` field. Be
+      // generous in what we accept so future minor schema tweaks don't break the parse.
+      const items: any[] = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.books)
+          ? payload.books
+          : Array.isArray(payload?.data)
+            ? payload.data
+            : [];
+      for (const item of items) {
+        const id = String(item?.asset_id ?? item?.token_id ?? item?.tokenId ?? '');
+        if (!id) continue;
+        if (!Array.isArray(item?.bids) && !Array.isArray(item?.asks)) continue;
+        results.set(id, buildOrderbook(this.name, id, item));
+      }
+    }
+    return results;
   }
 
   wsWatchStats(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } {
