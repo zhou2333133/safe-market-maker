@@ -202,17 +202,28 @@ export class MarketDataSyncService {
     await mapWithConcurrency(allMarketsToFetch, ORDERBOOK_SYNC_CONCURRENCY, async (market) => {
       try {
         const previousBook = cachedBooks.get(market.tokenId);
-        let book = wsWatch ? this.adapter.getCachedOrderbook?.(market.tokenId) : undefined;
+        // Source priority:
+        //  1) bulkBooks — these were JUST fetched this cycle via POST /books, freshest source we have.
+        //  2) WS cache — only if it's within the risk engine's staleBookMs (older entries are stale primes
+        //     from previous cycles that would get the submit rejected as "stale orderbook").
+        //  3) single REST fetch — last resort for tokens neither bulk nor WS covered.
+        // Old code did WS-first, which served 30+s old primed books even when bulkBooks had a fresh
+        // copy — causing every submit on those markets to get rejected at the staleBookMs gate.
+        let book: Orderbook | undefined;
         let restFetched = false;
-        if (book) {
-          wsServed += 1;
-        } else if (bulkBooks.has(market.tokenId)) {
-          // Bulk /books already fetched this one — counts as a REST read (it WAS a REST round-trip, just shared)
-          // and primes the WS cache identically to a single-fetch result.
-          book = bulkBooks.get(market.tokenId)!;
+        const fromBulk = bulkBooks.get(market.tokenId);
+        if (fromBulk) {
+          book = fromBulk;
           restReads += 1;
           restFetched = true;
-        } else {
+        } else if (wsWatch) {
+          const cached = this.adapter.getCachedOrderbook?.(market.tokenId);
+          if (cached && Date.now() - cached.receivedAt <= this.config.risk.staleBookMs) {
+            book = cached;
+            wsServed += 1;
+          }
+        }
+        if (!book) {
           restReads += 1;
           restFetched = true;
           // Under watch-all a cache miss goes STRAIGHT to REST (skip the blocking WS wait) so heavy ticks stay
