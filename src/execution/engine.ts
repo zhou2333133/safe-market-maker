@@ -178,6 +178,9 @@ export class ExecutionEngine {
         stopReason,
         accountRisk,
         canceledManagedOrders: cancel.canceledIds.length,
+        ...(cancel.failedIds && cancel.failedIds.length > 0
+          ? { cancelFailedIds: cancel.failedIds, cancelError: cancel.cancelError }
+          : {}),
         ...(killExit ? { killExit } : {})
       });
       // If positions remain after the in-cycle retries, do NOT stop the loop yet — keep cycling in exit-only mode so

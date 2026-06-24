@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
 import { appConfigSchema, assertEndpointAllowed, assertNoRawSecrets, normalizeLiveStrategyConfig, type AppConfig } from './schema.js';
-import { ensurePolymarketParams, ensurePredictParams } from './venue-config.js';
+import { ensurePolymarketParams, ensurePredictParams, stripVenuePrefixedStrategy } from './venue-config.js';
 
 export interface LoadedConfig {
   config: AppConfig;
@@ -43,7 +43,26 @@ export function writeDefaultConfig(configPath = defaultConfigPath()): void {
 }
 
 export function saveConfig(configPath: string, config: AppConfig): void {
-  const normalized = normalizeLiveStrategyConfig(config);
+  // Before serialising back to YAML, strip cross-venue fields from each venue's strategy block so the YAML
+  // self-heals as the user edits config. Without this, an originally-dirty config.yaml (with predict* keys under
+  // polymarketParams.strategy or vice versa) would round-trip unchanged forever; with this, every save removes
+  // one more set of misplaced fields, and a clean config stays clean.
+  const cleaned: AppConfig = {
+    ...config,
+    ...(config.predictParams ? {
+      predictParams: {
+        risk: config.predictParams.risk,
+        strategy: stripVenuePrefixedStrategy(config.predictParams.strategy, 'predict')
+      }
+    } : {}),
+    ...(config.polymarketParams ? {
+      polymarketParams: {
+        risk: config.polymarketParams.risk,
+        strategy: stripVenuePrefixedStrategy(config.polymarketParams.strategy, 'polymarket')
+      }
+    } : {})
+  };
+  const normalized = normalizeLiveStrategyConfig(cleaned);
   assertNoRawSecrets(normalized);
   mkdirSync(path.dirname(path.resolve(configPath)), { recursive: true });
   writeFileSync(configPath, YAML.stringify(normalized), 'utf8');

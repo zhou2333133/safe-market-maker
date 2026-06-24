@@ -224,9 +224,9 @@ export const appConfigSchema = z.object({
     strategy: strategySchema
   }).optional()
   ,
-  // Predict's independent risk + strategy parameters (same pattern as polymarketParams). When present,
-  // resolveVenueConfig() uses this block for Predict. When absent, Predict falls back to the top-level
-  // risk/strategy (backward-compatible). Optional; load.ts synthesizes it from the base config on first load.
+  // Predict's independent risk + strategy parameters (same pattern as polymarketParams). resolveVenueConfig() uses
+  // this block for Predict and throws if it is missing; load.ts MUST synthesize it on every load via
+  // ensurePredictParams so a brand-new config starts from a snapshot of the base, then diverges independently.
   predictParams: z.object({
     risk: riskSchema,
     strategy: strategySchema

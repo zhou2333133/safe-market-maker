@@ -465,7 +465,16 @@ function polymarketLpGroups(config: AppConfig, venue: VenueName, candidates: Mar
       const expected = expectedOutcomeCount(legs.map((leg) => leg.market));
       // Two-sided LP needs both legs (YES + NO) of the same group quotable at once.
       if (expected === undefined || legs.length < Math.min(2, expected)) return [];
-      const targetOrderUsd = legs.reduce((sum, leg) => sum + leg.metrics.targetOrderUsd, 0);
+      // Capital occupied per group:
+      //  - negRisk markets: YES + NO BUYs share collateral (settlement pays at most ONE side, so the CLOB nets the
+      //    requirement to max(legY, legN) rather than sum). Reflect that in efficiency or negRisk groups get a 2x
+      //    artificially-inflated denominator and lose every sort against non-negRisk.
+      //  - non-negRisk markets: each leg locks its own collateral, so sum is correct.
+      // This is POLYMARKET-ONLY routing math; Predict's router does not call this function.
+      const isNegRiskGroup = legs.length > 0 && legs.every((leg) => leg.market.negRisk === true);
+      const targetOrderUsd = isNegRiskGroup
+        ? Math.max(...legs.map((leg) => leg.metrics.targetOrderUsd))
+        : legs.reduce((sum, leg) => sum + leg.metrics.targetOrderUsd, 0);
       // Prefer the official two-sided Qmin reward model; fall back to summing one-sided legs
       // when per-leg scores aren't available (e.g. missing book).
       const expectedPpPerHour = polymarketTwoSidedGroupExpectedPpPerHour(legs)

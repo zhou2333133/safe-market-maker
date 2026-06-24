@@ -15,6 +15,11 @@ interface LiveBook {
   bids: Map<number, number>;
   asks: Map<number, number>;
   receivedAt: number;
+  /** True when the book came from primeBook() (REST snapshot injection) and not from a WS `book` push. After a WS
+   *  disconnect we MUST NOT serve a primed book that pre-dates the disconnect — Polymarket does not auto-resnapshot
+   *  on reconnect for quiet markets, so the only freshness signal we have is "have we seen a real WS push since the
+   *  last reconnect". cachedBook() consults this together with primeInvalidatedAt to enforce that rule. */
+  primed?: boolean;
 }
 
 interface Waiter {
@@ -58,6 +63,10 @@ export class PolymarketWsClient {
   private lastUserActivityAt = 0;
   private accountEventsSeq = 0;
   private tradeEventsSeq = 0;
+  /** Timestamp of the most recent WS disconnect. After a disconnect, any primed (REST-injected) book whose
+   *  receivedAt is older than this is no longer a valid fallback — the underlying market may have moved while the
+   *  WS was down and Polymarket will not re-snapshot quiet markets. Reset to 0 on a real WS book push. */
+  private primeInvalidatedAt = 0;
   private readonly userEvents: Array<{ type: string; data: unknown; receivedAt: number }> = [];
 
   constructor(private readonly wsUrl: string) {}
@@ -144,7 +153,7 @@ export class PolymarketWsClient {
     const asks = new Map<number, number>();
     for (const level of book.bids || []) if (level.price > 0 && level.price < 1 && level.size > 0) bids.set(level.price, level.size);
     for (const level of book.asks || []) if (level.price > 0 && level.price < 1 && level.size > 0) asks.set(level.price, level.size);
-    this.books.set(tokenId, { bids, asks, receivedAt: book.receivedAt || Date.now() });
+    this.books.set(tokenId, { bids, asks, receivedAt: book.receivedAt || Date.now(), primed: true });
   }
 
   stats(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } {
@@ -285,6 +294,10 @@ export class PolymarketWsClient {
   private cachedBook(tokenId: string, maxAgeMs: number): Orderbook | undefined {
     const live = this.books.get(tokenId);
     if (!live || Date.now() - live.receivedAt > maxAgeMs) return undefined;
+    // If a WS disconnect happened after this book was primed (no real WS snapshot since), treat it as stale even
+    // when its absolute age is < maxAgeMs. Polymarket does not re-snapshot quiet markets on reconnect, so a primed
+    // book pre-dating the disconnect can silently misprice quotes.
+    if (live.primed && this.primeInvalidatedAt > 0 && live.receivedAt < this.primeInvalidatedAt) return undefined;
     const book = this.buildBook(tokenId, live);
     return saneBook(book) ? book : undefined;
   }
@@ -346,6 +359,10 @@ export class PolymarketWsClient {
     this.socket = undefined;
     this.connecting = undefined;
     this.subscribedAssets.clear();
+    // Mark every cached book as needing a fresh post-reconnect snapshot before it can be served as primed-fallback.
+    // We don't clear this.books here because a successful reconnect + a subsequent `book` push will overwrite the
+    // entry (with primed=false) and restore service; but until that push arrives, cachedBook() will skip the entry.
+    this.primeInvalidatedAt = Date.now();
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = undefined;
@@ -392,7 +409,13 @@ export class PolymarketWsClient {
   }
 
   private applyChanges(assetId: string, changes: unknown): void {
-    const book = this.books.get(assetId) ?? { bids: new Map<number, number>(), asks: new Map<number, number>(), receivedAt: Date.now() };
+    const existing = this.books.get(assetId);
+    // Never layer incremental changes on top of a still-primed REST snapshot — the baseline is presumed stale (the
+    // entire reason primeBook exists is to bridge a missing real snapshot) so applying deltas to it would advance
+    // receivedAt past primeInvalidatedAt and let cachedBook serve a numerically wrong book as fresh. Wait for the
+    // real `book` snapshot to overwrite the primed entry first.
+    if (existing?.primed) return;
+    const book = existing ?? { bids: new Map<number, number>(), asks: new Map<number, number>(), receivedAt: Date.now() };
     if (Array.isArray(changes)) {
       for (const change of changes) {
         if (!change || typeof change !== 'object') continue;

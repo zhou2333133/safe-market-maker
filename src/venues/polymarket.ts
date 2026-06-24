@@ -485,11 +485,28 @@ export class PolymarketVenue implements VenueAdapter {
 
   async preflight(signer: SignerProvider, _tokenIds: string[] = []): Promise<PreflightResult> {
     const funder = this.config.venues.polymarket.funderAddress || signer.address;
+    const sigType = this.config.venues.polymarket.signatureType;
+    // signatureType 1 / 2 (Polymarket proxy) and 3 (Gnosis Safe) require a proxy/Safe-aware signer that supplies
+    // the funder wallet's signing strategy (EIP-1271 for Safe, proxy-relayed signing for type 2). LocalWalletSigner
+    // only signs as a plain EOA, so configuring it with sigType != 0 produces signatures the CLOB will reject
+    // silently — the bot would appear to run normally while every order/cancel fails. Fail closed.
+    const sigTypeValid = [0, 1, 2, 3].includes(sigType);
+    const signerIsLocalEoa = !(signer instanceof LocalWalletSigner) ? false : sigType === 0;
+    const sigTypeCompatible = sigTypeValid && (sigType === 0
+      ? signer instanceof LocalWalletSigner
+      : !(signer instanceof LocalWalletSigner));
+    const sigTypeMessage = !sigTypeValid
+      ? `signatureType ${sigType} 非法（必须 0|1|2|3）`
+      : sigTypeCompatible
+        ? `${sigType}${signerIsLocalEoa ? '（EOA 兼容）' : '（proxy/Safe 兼容签名器）'}`
+        : sigType === 0
+          ? `signatureType=0 需要 EOA signer，当前 signer 不是 LocalWalletSigner`
+          : `signatureType=${sigType}（${sigType === 3 ? 'Gnosis Safe' : 'Polymarket proxy'}）需要 proxy/Safe 兼容 signer，当前是 LocalWalletSigner（EOA）— 启用将导致所有下单/撤单静默失败`;
     const checks: PreflightResult['checks'] = [
       { name: 'clob-credentials', ok: Boolean(this.credential), message: this.credential ? 'loaded from encrypted credential' : 'missing; run mm auth polymarket' },
       { name: 'signer-address', ok: /^0x[a-fA-F0-9]{40}$/.test(signer.address), message: signer.address },
       { name: 'funder-address', ok: /^0x[a-fA-F0-9]{40}$/.test(funder), message: funder },
-      { name: 'signature-type', ok: [0, 1, 2, 3].includes(this.config.venues.polymarket.signatureType), message: String(this.config.venues.polymarket.signatureType) }
+      { name: 'signature-type', ok: sigTypeCompatible, message: sigTypeMessage }
     ];
     try {
       const version = await this.client().getVersion();
@@ -854,8 +871,35 @@ export class PolymarketVenue implements VenueAdapter {
   async cancelOrders(orderIds: string[]): Promise<void> {
     if (orderIds.length === 0) return;
     if (!this.credential) throw new Error('Polymarket CLOB credentials are required. Run mm auth polymarket first.');
-    await this.client(undefined, this.lastL2Address ?? this.config.venues.polymarket.funderAddress).cancelOrders(orderIds);
+    this.lastCancelFailedIds = [];
+    // CLOB.cancelOrders typically returns { canceled: string[], not_canceled: { [id]: string } } (per-id reasons).
+    // Two failure modes deserve different handling:
+    //  1) The whole call raises (network 5xx, 401, malformed creds) — caller already handles via try/catch and
+    //     marks the cancel as failed, leaving local OPEN orders for the next reconcile.
+    //  2) The call succeeds but some ids end up in not_canceled (e.g. already filled, already canceled, unknown
+    //     id). The cleanest behaviour is: log per-id reasons, treat already-gone ids as effectively canceled
+    //     (the order is no longer on the book), and only throw if EVERY id failed for a non-terminal reason.
+    const response = await this.client(undefined, this.lastL2Address ?? this.config.venues.polymarket.funderAddress).cancelOrders(orderIds) as unknown;
     this.invalidateAccountCaches();
+    const result = (response && typeof response === 'object') ? response as Record<string, unknown> : {};
+    const notCanceledRaw = result.not_canceled ?? (result as Record<string, unknown>).notCanceled;
+    const notCanceled = (notCanceledRaw && typeof notCanceledRaw === 'object') ? notCanceledRaw as Record<string, string> : {};
+    const failedIds = Object.keys(notCanceled);
+    if (failedIds.length === 0) return;
+    const allFailedAndNonTerminal = failedIds.length === orderIds.length
+      && failedIds.every((id) => !/already|not[_ ]found|filled|matched|canceled/i.test(String(notCanceled[id] ?? '')));
+    if (allFailedAndNonTerminal) {
+      throw new Error(`Polymarket cancelOrders rejected all ${orderIds.length} ids: ${failedIds.map((id) => `${id}: ${notCanceled[id]}`).join('; ')}`);
+    }
+    // Partial / terminal — surface details so the caller can decide whether to retry the failed ids.
+    this.lastCancelFailedIds = failedIds;
+  }
+
+  private lastCancelFailedIds: string[] = [];
+
+  /** Ids reported as not_canceled by the most recent cancelOrders call (cleared on the next success). */
+  getLastCancelFailedIds(): string[] {
+    return [...this.lastCancelFailedIds];
   }
 
   private async loadRewards(): Promise<void> {

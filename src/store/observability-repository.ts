@@ -45,7 +45,27 @@ export interface CashFillCooldownEntry {
   source: 'fill-circuit-breaker.triggered' | 'cash-fill.exit-submitted';
 }
 
+/**
+ * Per-(venue,type) sampling window for high-frequency event types that would otherwise dominate the events table.
+ * Mirrors the noisy-type list filtered out of forensic-log.ts so the two surfaces stay consistent. The dedup is
+ * scoped per venue so a burst on Polymarket can never cause Predict events to be dropped.
+ */
+const NOISY_EVENT_SAMPLE_WINDOW_MS = 60_000;
+const NOISY_EVENT_TYPES = new Set([
+  'quote.skip-existing',
+  'quote.final-repriced',
+  'orderbook.unavailable',
+  'orderbook.unhealthy',
+  'open-orders.unavailable',
+  'ws.book-stale',
+  'ws.user-channel-stale'
+]);
+
 export class ObservabilityRepository {
+  // Last-recorded timestamp keyed by `${venue ?? '-'}::${type}` so identical events bursting at high frequency get
+  // sampled to at most one row per window. Stored in-process (acceptable: events table is also process-local).
+  private readonly noisyLastRecordedAt = new Map<string, number>();
+
   constructor(private readonly db: Database.Database) {}
 
   recordEvent(input: {
@@ -55,6 +75,7 @@ export class ObservabilityRepository {
     message: string;
     details?: unknown;
   }): void {
+    if (this.shouldDropNoisyEvent(input)) return;
     this.db.prepare(`
       INSERT INTO events (ts, venue, severity, type, message, details_json)
       VALUES (@ts, @venue, @severity, @type, @message, @details_json)
@@ -66,6 +87,18 @@ export class ObservabilityRepository {
       message: redactString(input.message),
       details_json: JSON.stringify(redact(input.details ?? {}))
     });
+  }
+
+  private shouldDropNoisyEvent(input: { venue?: VenueName; severity?: 'info' | 'warn' | 'error'; type: string }): boolean {
+    if (!NOISY_EVENT_TYPES.has(input.type)) return false;
+    // Errors / warns always pass even for noisy types — they're the ones operators need to see.
+    if (input.severity === 'error' || input.severity === 'warn') return false;
+    const key = `${input.venue ?? '-'}::${input.type}`;
+    const now = Date.now();
+    const last = this.noisyLastRecordedAt.get(key) ?? 0;
+    if (now - last < NOISY_EVENT_SAMPLE_WINDOW_MS) return true;
+    this.noisyLastRecordedAt.set(key, now);
+    return false;
   }
 
   listRecentEvents(limit = 20): RecentEvent[] {

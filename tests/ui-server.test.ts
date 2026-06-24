@@ -280,12 +280,14 @@ describe('local UI server', () => {
     }
   });
 
-  it('keeps Predict and Polymarket live switches independent', async () => {
+  it('keeps Predict and Polymarket live switches independent (top-level enabled, venue level toggled)', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'safe-mm-ui-'));
     const configPath = path.join(dir, 'config.yaml');
+    // Top-level is the global kill switch (AND-merged with each venue's own flag, see live-enabled.ts). Keep it
+    // ENABLED here so we can exercise true per-venue independence without the kill-switch masking the result.
     saveConfig(configPath, appConfigSchema.parse({
       dataDir: '.safe-mm',
-      liveEnabled: false,
+      liveEnabled: true,
       venues: {
         predict: { liveEnabled: false },
         polymarket: { liveEnabled: true }
@@ -295,29 +297,31 @@ describe('local UI server', () => {
     try {
       const script = await (await fetch(`${server.url}/app.js`)).text();
       const token = /const UI_TOKEN = "([^"]+)"/.exec(script)?.[1];
+      // Helper: all mutation requests now require a same-origin Origin header in addition to the UI token.
+      const sameOrigin = { origin: server.url };
 
       const predictUpdate = await fetch(`${server.url}/api/config/trading`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-safe-mm-ui-token': token ?? '' },
+        headers: { 'content-type': 'application/json', 'x-safe-mm-ui-token': token ?? '', ...sameOrigin },
         body: JSON.stringify({ venue: 'predict', liveEnabled: true })
       });
       expect(await predictUpdate.json()).toMatchObject({
         ok: true,
         config: {
-          liveEnabled: false,
+          liveEnabled: true,
           liveEnabledByVenue: { predict: true, polymarket: true }
         }
       });
 
       const polymarketUpdate = await fetch(`${server.url}/api/config/trading`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-safe-mm-ui-token': token ?? '' },
+        headers: { 'content-type': 'application/json', 'x-safe-mm-ui-token': token ?? '', ...sameOrigin },
         body: JSON.stringify({ venue: 'polymarket', liveEnabled: false })
       });
       expect(await polymarketUpdate.json()).toMatchObject({
         ok: true,
         config: {
-          liveEnabled: false,
+          liveEnabled: true,
           liveEnabledByVenue: { predict: true, polymarket: false }
         }
       });
@@ -330,6 +334,27 @@ describe('local UI server', () => {
           polymarket: { liveEnabled: false }
         }
       });
+    } finally {
+      await server.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('AND-merge: top-level liveEnabled=false locks BOTH venues off regardless of venue flags', async () => {
+    // SEC-008 hardening: the historical OR-style override let a stale config.yaml leave a venue silently live
+    // even when the user thought they had killed live at the top level. AND-merge makes the top-level the
+    // global kill switch.
+    const dir = mkdtempSync(path.join(tmpdir(), 'safe-mm-ui-'));
+    const configPath = path.join(dir, 'config.yaml');
+    saveConfig(configPath, appConfigSchema.parse({
+      dataDir: '.safe-mm',
+      liveEnabled: false,
+      venues: { predict: { liveEnabled: true }, polymarket: { liveEnabled: true } }
+    }));
+    const server = await startUiServer(configPath, { port: 0 });
+    try {
+      const status = await (await fetch(`${server.url}/api/status`)).json();
+      expect(status.config.liveEnabledByVenue).toEqual({ predict: false, polymarket: false });
     } finally {
       await server.close();
       rmSync(dir, { recursive: true, force: true });

@@ -14,6 +14,10 @@ export interface CancelReplaceableOrdersResult {
   canceledIds: string[];
   /** Token ids whose orders were cancelled this cycle — used to defer the replace-race re-place on small wallets. */
   canceledTokenIds?: string[];
+  /** Ids that could not be cancelled (adapter raised). Caller may retry / schedule reconcile. */
+  failedIds?: string[];
+  /** The error string from the adapter on a failed cancel; undefined on success. */
+  cancelError?: string;
 }
 
 export interface CancelReplaceableOrdersOptions {
@@ -381,7 +385,22 @@ export class CancelService {
     const managedOpenOrders = this.managedOpenOrders(venue, openOrders);
     const ids = [...new Set(managedOpenOrders.map((order) => order.externalId).filter(Boolean))];
     if (ids.length === 0) return { openOrders, canceledIds: [] };
-    await this.adapter.cancelOrders(ids);
+    // Total stop-loss must NOT crash the venue loop. If the adapter raises, we record the failure, leave the local
+    // ledger as-is (so the next reconcile can correct it), and return a partial result so the engine can switch to
+    // exit-only mode for THIS venue without affecting the other one.
+    try {
+      await this.adapter.cancelOrders(ids);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.store.recordEvent({
+        venue,
+        severity: 'error',
+        type: `${eventType}.failed`,
+        message: `${reason}：撤单调用失败，本轮保留本地订单状态待下轮对账`,
+        details: { ids, reason, error: message, semantics: cancelSemantics(venue) }
+      });
+      return { openOrders, canceledIds: [], failedIds: ids, cancelError: message };
+    }
     this.store.markOrdersCanceled(venue, ids);
     this.store.recordEvent({
       venue,

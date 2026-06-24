@@ -61,19 +61,64 @@ interface UiSingletonLock {
 
 let globalRejectionGuardInstalled = false;
 
+const UNHANDLED_REJECTION_WINDOW_MS = 60_000;
+const UNHANDLED_REJECTION_EXIT_THRESHOLD = 20;
+
 /**
  * Process-level backstop so a stray async rejection from EITHER venue can never crash the shared process that
  * hosts both live loops. Each venue loop already .catch()es its own failures (see live-controller); this only
  * guards true strays. We log and keep running — the other venue must stay up.
+ *
+ * Escalation: a healthy process produces ~0 unhandled rejections. If we see > THRESHOLD inside WINDOW the
+ * process is wedged in a tight rejection loop (typical: an adapter throwing a fresh promise per tick) and we
+ * MUST exit so the OS/supervisor restarts a clean process — silent log spam at 100Hz is worse than restart.
  */
 function installGlobalRejectionGuard(): void {
   if (globalRejectionGuardInstalled) return;
   globalRejectionGuardInstalled = true;
+  const recent: number[] = [];
   process.on('unhandledRejection', (reason) => {
     logger.error('Unhandled promise rejection contained; process kept alive so the other venue keeps running', {
       reason: reason instanceof Error ? reason.message : String(reason)
     });
+    const now = Date.now();
+    recent.push(now);
+    while (recent.length > 0 && now - recent[0]! > UNHANDLED_REJECTION_WINDOW_MS) recent.shift();
+    if (recent.length >= UNHANDLED_REJECTION_EXIT_THRESHOLD) {
+      logger.error(`Unhandled rejection storm: ${recent.length} in ${UNHANDLED_REJECTION_WINDOW_MS}ms — exiting so a supervisor can restart cleanly`);
+      process.exit(1);
+    }
   });
+}
+
+/** Same-origin check for mutation endpoints. Returns the expected serverInfo URL the request must match. */
+function isOriginAllowed(req: IncomingMessage, serverInfo: { host: string; port: number }): boolean {
+  const origin = req.headers['origin'];
+  const referer = req.headers['referer'];
+  const expectedHosts = new Set([
+    `${serverInfo.host}:${serverInfo.port}`,
+    `127.0.0.1:${serverInfo.port}`,
+    `localhost:${serverInfo.port}`
+  ]);
+  // No Origin AND no Referer: same-origin browser GETs sometimes omit Origin, but we only reach this for non-GET,
+  // so a missing Origin/Referer is suspicious. Allow only if the Host header itself is loopback (CLI curl flows).
+  if (!origin && !referer) {
+    const host = String(req.headers['host'] ?? '');
+    return expectedHosts.has(host);
+  }
+  if (origin) {
+    try {
+      const o = new URL(String(origin));
+      return expectedHosts.has(o.host);
+    } catch { return false; }
+  }
+  if (referer) {
+    try {
+      const r = new URL(String(referer));
+      return expectedHosts.has(r.host);
+    } catch { return false; }
+  }
+  return false;
 }
 
 export async function startUiServer(configPath: string, options: UiServerOptions = {}): Promise<UiServerHandle> {
@@ -264,6 +309,12 @@ async function handleRequest(
     return;
   }
   if (url.pathname.startsWith('/api/') && req.method !== 'GET') {
+    // Origin / Referer check first: a stolen uiToken alone (e.g. via XSS, a malicious same-machine process reading
+    // /app.js) must not be enough to fire mutations. The same-origin guard restricts where the request can come
+    // from, which is what the CSP can't enforce on the server side.
+    if (!isOriginAllowed(req, serverInfo)) {
+      throw new UiError(403, 'UI 同源校验失败。请从本机 UI 页面操作。');
+    }
     const token = req.headers['x-safe-mm-ui-token'];
     if (token !== uiToken) throw new UiError(403, 'UI token 校验失败。请从本机 UI 页面操作。');
   }

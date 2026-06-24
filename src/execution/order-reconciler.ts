@@ -27,6 +27,15 @@ export class OrderReconciler {
       return { ok: true, openOrders: mergeLocalManagedOpenOrders(openOrders, this.store.listManagedOpenOrders(venue)) };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // Local-only state cleanup MUST still run when the remote getOpenOrders fails: PENDING_OPEN orders that never
+      // got their confirmation, and PLANNED orders that never got their submit-result callback, are stuck in the
+      // local ledger until something marks them. Without this catch-side sweep, repeated venue outages leak ghost
+      // orders that the fast-tick path will then keep trying to manage. These markers are pure local-time deductions
+      // (no remote call) so they cannot themselves throw.
+      try {
+        this.store.markStalePendingOpenOrdersCanceled(venue, PENDING_OPEN_CONFIRMATION_GRACE_MS);
+        this.store.markStalePlannedOrdersUnknown(venue, PLANNED_ORDER_SUBMIT_GRACE_MS);
+      } catch { /* never let cleanup itself surface as the failure */ }
       this.store.recordEvent({
         venue,
         severity: 'error',

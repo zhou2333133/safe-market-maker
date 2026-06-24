@@ -12,7 +12,7 @@ export function ensurePredictParams(config: AppConfig): AppConfig {
     ...config,
     predictParams: {
       risk: structuredClone(config.risk),
-      strategy: structuredClone(config.strategy)
+      strategy: stripVenuePrefixedStrategy(structuredClone(config.strategy), 'predict')
     }
   };
 }
@@ -23,27 +23,53 @@ export function ensurePolymarketParams(config: AppConfig): AppConfig {
     ...config,
     polymarketParams: {
       risk: structuredClone(config.risk),
-      strategy: structuredClone(config.strategy)
+      strategy: stripVenuePrefixedStrategy(structuredClone(config.strategy), 'polymarket')
     }
   };
 }
 
 /**
- * Return the risk + strategy a given venue must run on. Predict => its predictParams block (falls back to
- * top-level config for backward compat). Polymarket => its polymarketParams block. Everything downstream
- * (engine, risk, strategy, router, data-sync) receives the resolved config and needs no venue-awareness.
+ * Remove the other-venue's prefixed fields from a strategy block. Fields whose name starts with `polymarket` only
+ * belong in polymarketParams.strategy; fields starting with `predict` only belong in predictParams.strategy. The
+ * single `strategySchema` definition is shared (zod doesn't have a clean way to model "venue tag → field"), but
+ * this stripper enforces the invariant at the seams: every place that builds a venue strategy block runs through
+ * it, so cross-venue fields cannot survive to runtime even if a user (or the UI write path) put them there.
+ *
+ * Non-mutating: returns a NEW object so callers can safely structuredClone() upstream.
+ */
+export function stripVenuePrefixedStrategy<T extends Record<string, unknown>>(strategy: T, venue: VenueName): T {
+  const out: Record<string, unknown> = {};
+  const otherPrefix = venue === 'predict' ? 'polymarket' : 'predict';
+  for (const [key, value] of Object.entries(strategy)) {
+    if (key.startsWith(otherPrefix)) continue;
+    out[key] = value;
+  }
+  return out as T;
+}
+
+/**
+ * Return the risk + strategy a given venue must run on. Predict => its predictParams block. Polymarket =>
+ * its polymarketParams block. The two blocks are SEPARATE COPIES with ZERO fallback to the top-level config —
+ * load.ts is required to synthesize the missing block via ensurePredictParams / ensurePolymarketParams before
+ * any venue runs, so a missing block at this point is a programmer error (config went through a path that
+ * skipped the synth) and must throw, not silently fall back to a mixed top-level block. The throw is what
+ * preserves the "edits to one venue can NEVER leak to the other" invariant.
  */
 export function resolveVenueConfig(config: AppConfig, venue: VenueName): AppConfig {
   if (venue === 'predict') {
     const params = config.predictParams;
-    if (!params) return config;
-    return { ...config, risk: params.risk, strategy: params.strategy };
+    if (!params) {
+      throw new Error('predictParams is missing from config — ensurePredictParams() must be called on every load path before resolveVenueConfig().');
+    }
+    // Strip any polymarket* leaks that may have entered predictParams.strategy via YAML edits or UI write-backs.
+    // This is a defence-in-depth seam — the engine sees a clean venue-pure strategy block regardless of upstream
+    // hygiene. Predict can NEVER read a polymarket-only field at runtime even if it's physically present in YAML.
+    return { ...config, risk: params.risk, strategy: stripVenuePrefixedStrategy(params.strategy, 'predict') };
   }
   if (venue !== 'polymarket') return config;
   const params = config.polymarketParams;
   if (!params) {
-    // Defensive: a config that skipped ensurePolymarketParams() still resolves safely to the base values.
-    return config;
+    throw new Error('polymarketParams is missing from config — ensurePolymarketParams() must be called on every load path before resolveVenueConfig().');
   }
   // For two-sided LP the real per-ORDER size is the total budget split across legs (polymarketLpTotalUsd /
   // maxTokensPerMarket), NOT the (often stale) base orderSizeUsd. Reflect it in risk.orderSizeUsd so the capital
@@ -62,5 +88,7 @@ export function resolveVenueConfig(config: AppConfig, venue: VenueName): AppConf
       };
     }
   }
-  return { ...config, risk, strategy: params.strategy };
+  // Strip any predict* leaks before handing the strategy to the Polymarket engine — symmetric to the predict
+  // branch above so neither venue can observe the other's prefixed parameters at runtime.
+  return { ...config, risk, strategy: stripVenuePrefixedStrategy(params.strategy, 'polymarket') };
 }
