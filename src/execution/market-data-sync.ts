@@ -158,14 +158,22 @@ export class MarketDataSyncService {
     const safeMarketTokenIds = new Set(safeMarkets.map((m) => m.tokenId));
     const coldOpenOrderMarkets = (openOrderMarkets ?? []).filter((m) => m.venue === venue && !safeMarketTokenIds.has(m.tokenId));
     const allMarketsToFetch = [...safeMarkets, ...coldOpenOrderMarkets];
-    // Try one bulk POST /books call up front for the markets the WS cache doesn't cover. Single-fetch fallback in
-    // the per-market loop handles whatever the bulk call didn't return (network error, partial response, unknown
-    // tokens). Only the venue that exposes getOrderbooksBatch (currently Polymarket) takes this path; Predict's
-    // adapter leaves it undefined and the loop runs exactly as before, single-fetch per market.
+    // Try one bulk POST /books call up front for the markets the WS cache doesn't cover with a FRESH book.
+    // "Fresh" = within staleBookMs (the same threshold the risk engine uses); anything older is re-fetched even
+    // if WS has it cached, because submit-time stale-book guard will reject placement on an out-of-date book.
+    // Single-fetch fallback in the per-market loop handles whatever the bulk call didn't return. Only the venue
+    // that exposes getOrderbooksBatch (currently Polymarket) takes this path; Predict's adapter leaves it
+    // undefined and the loop runs exactly as before, single-fetch per market.
     const bulkBooks = new Map<string, Orderbook>();
+    const staleBookCutoff = Date.now() - this.config.risk.staleBookMs;
     if (typeof this.adapter.getOrderbooksBatch === 'function' && allMarketsToFetch.length > 0) {
       const tokensNeedingFetch = allMarketsToFetch
-        .filter((market) => !(wsWatch ? this.adapter.getCachedOrderbook?.(market.tokenId) : undefined))
+        .filter((market) => {
+          if (!wsWatch) return true;
+          const cached = this.adapter.getCachedOrderbook?.(market.tokenId);
+          // Re-fetch if no cache OR the cache entry is already stale by the risk-engine's threshold.
+          return !cached || cached.receivedAt < staleBookCutoff;
+        })
         .map((market) => market.tokenId);
       if (tokensNeedingFetch.length > 0) {
         try {
