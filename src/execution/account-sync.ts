@@ -29,9 +29,27 @@ export interface AccountSyncInput {
 export interface PositionSyncResult {
   ok: boolean;
   positions: Position[];
+  /** True when positions come from the in-memory cache because the live fetch failed. Caller must treat
+   *  these as "best-known recent" (no fresh ack of fills/transfers) and skip any flow that could place a
+   *  new order based on assumed capital — but retreat / cancel / fill-circuit-breaker can still run. */
+  cached?: boolean;
+  /** Age (ms) of the cached positions when `cached === true`. Undefined on a fresh fetch. */
+  cachedAgeMs?: number;
 }
 
 export class AccountSyncService {
+  // Per-venue in-memory cache of the latest SUCCESSFUL position fetch. Survives across cycles within one
+  // process lifetime so a transient venue/data-api outage (e.g. Polymarket data-api stall through a proxy
+  // node) can still hand back the most recent known positions to the engine — which then runs in
+  // PROTECT-ONLY mode: cancel/retreat existing orders but place no new ones. Without this fallback the
+  // engine exited the cycle entirely and resting orders went unsupervised until they got filled.
+  private readonly lastKnownPositions = new Map<VenueName, { positions: Position[]; capturedAt: number }>();
+  // After this many ms a cached snapshot is treated as too stale to even drive protect-only logic. Long
+  // enough to survive multi-minute proxy outages, short enough that an hours-long outage doesn't quietly
+  // run on day-old position data. Tuned to match the operator's intuition that a multi-hour stall is a
+  // problem the operator must notice.
+  private static readonly POSITIONS_CACHE_TTL_MS = 30 * 60_000;
+
   constructor(
     private readonly config: AppConfig,
     private readonly adapter: VenueAdapter,
@@ -186,18 +204,35 @@ export class AccountSyncService {
 
   async syncPositions(input: Pick<AccountSyncInput, 'venue' | 'signerAddress'>): Promise<PositionSyncResult> {
     try {
-      return {
-        ok: true,
-        positions: await this.adapter.getPositions(input.signerAddress)
-      };
+      const positions = await this.adapter.getPositions(input.signerAddress);
+      this.lastKnownPositions.set(input.venue, { positions, capturedAt: Date.now() });
+      return { ok: true, positions };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const cached = this.lastKnownPositions.get(input.venue);
+      const ageMs = cached ? Date.now() - cached.capturedAt : undefined;
+      const cacheUsable = !!cached && ageMs !== undefined && ageMs <= AccountSyncService.POSITIONS_CACHE_TTL_MS;
+      if (cacheUsable && cached) {
+        // PROTECT-ONLY fallback: hand back the cached positions and tag them stale. The engine routes this
+        // into the cancel/retreat path on existing orders but skips placing new ones, so a transient venue
+        // outage cannot leave resting orders unsupervised until they get filled.
+        this.store.recordEvent({
+          venue: input.venue,
+          severity: 'warn',
+          type: 'positions.cached-fallback',
+          message: `持仓接口失败，本轮使用 ${Math.round((ageMs ?? 0) / 1000)}s 前的持仓缓存，仅维护现有挂单(不新增)`,
+          details: { error: message, cachedAgeMs: ageMs, positionCount: cached.positions.length, reject: rejectReason('POSITIONS_UNAVAILABLE', 'platform', 'syncing-positions') }
+        });
+        return { ok: true, positions: cached.positions, cached: true, cachedAgeMs: ageMs };
+      }
       this.store.recordEvent({
         venue: input.venue,
         severity: 'error',
         type: 'positions.unavailable',
-        message: '持仓同步失败，本轮不会新增订单',
-        details: { error: message, reject: rejectReason('POSITIONS_UNAVAILABLE', 'platform', 'syncing-positions') }
+        message: cached
+          ? `持仓同步失败,且缓存已过期(${Math.round((ageMs ?? 0) / 1000)}s)，本轮不会新增订单也不维护现有挂单`
+          : '持仓同步失败，本轮不会新增订单',
+        details: { error: message, cachedAgeMs: ageMs, reject: rejectReason('POSITIONS_UNAVAILABLE', 'platform', 'syncing-positions') }
       });
       this.store.checkpoint(`run.${input.venue}`, { mode: 'live', skippedQuoting: true, reason: 'positions.unavailable' });
       return { ok: false, positions: [] };

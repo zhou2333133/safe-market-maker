@@ -51,6 +51,14 @@ export interface RunOnceResult {
   exitOnlyMode?: boolean;
   /** Count of material positions remaining when exitOnlyMode is true, for visibility. */
   exitOnlyPendingPositions?: number;
+  /**
+   * Cycle ran in protect-only mode: positions API was down so the bot used the cached positions snapshot
+   * to drive cancel/retreat on existing orders, but skipped new placement. Operator-visible flag so UI /
+   * monitoring can show "venue degraded, holding the line".
+   */
+  protectOnly?: boolean;
+  /** Generic "we did the protection work but did not submit new orders" flag (also set in fill-circuit-breaker / paused paths). */
+  skippedQuoting?: boolean;
 }
 
 function accountRiskStopReason(reason: AccountRiskDecision['reason']): RunOnceResult['stopReason'] | undefined {
@@ -121,13 +129,23 @@ export class ExecutionEngine {
       return {};
     }
     let positions = positionSync.positions;
+    // PROTECT-ONLY mode: positions came from the cached fallback because the venue's positions API was
+    // unreachable. We have enough info (recent positions + cached account-risk snapshot + fresh orderbooks
+    // via the bulk fetch we already did) to run the cancel/retreat path on existing orders so they don't
+    // sit unprotected until someone fills them — but we MUST NOT place new orders, because the cached
+    // positions don't reflect any fills/transfers that happened during the outage.
+    const protectOnly = positionSync.cached === true;
     let accountRisk: AccountRiskDecision;
-    if (options.fast) {
-      // Fast tick: reuse the most recent account-risk snapshot (refreshed every full cycle) instead of re-pulling the
-      // full fills/equity history each second — that pull is the dominant per-tick cost. evaluateAccountRisk re-checks
-      // the snapshot age, so a too-old snapshot still blocks new orders safely, and the per-fill exit below still runs
-      // on freshly-synced positions, so a fill is still detected and exited within this same tick.
-      this.stage(options.venue, 'syncing-account', '快速重报价：复用最近账户风控快照(跳过全量成交历史拉取)');
+    if (options.fast || protectOnly) {
+      // Fast tick OR protect-only fallback: reuse the most recent account-risk snapshot. Fast skips the
+      // heavy fills/equity pull for latency; protect-only skips it because the positions API is already
+      // down and the snapshot fetch shares that failure mode — we still need an evaluable risk decision
+      // to drive the cancel/retreat path on existing orders. evaluateAccountRisk re-checks the snapshot
+      // age, so a too-old snapshot still blocks new orders safely; and in protect-only we're not placing
+      // new orders anyway.
+      this.stage(options.venue, 'syncing-account', protectOnly
+        ? '持仓接口降级:复用最近账户风控快照,只维护现有挂单'
+        : '快速重报价：复用最近账户风控快照(跳过全量成交历史拉取)');
       const cachedSnapshot = this.store.getLatestAccountRiskSnapshot(options.venue);
       const snapshotForEval = cachedSnapshot
         ? ({ ...cachedSnapshot, fills: [], positions: [], balances: [] } as AccountRiskSnapshot)
@@ -425,6 +443,28 @@ export class ExecutionEngine {
         message: `余额不足以在同一抵押组同时容纳新旧两单(可用 $${availableUsd.toFixed(2)} < 2×单笔)，本轮先撤旧、下一轮待撤销结算后再挂新，避免"余额不足"被拒(${replaceRace.deferredTokenIds.length} 个)`,
         details: { tokens: replaceRace.deferredTokenIds, availableUsd, semantics: 'defer-one-cycle' }
       });
+    }
+    if (protectOnly) {
+      // Skip placement entirely in protect-only mode. cancelGuardedOrders + cancelReplaceableOrders +
+      // cashFillCircuitBreaker above already ran, so existing orders get retreated/cancelled when the
+      // front collapses or a fill is detected. The cycle returns reporting the protection work done but
+      // emits no new orders — those resume on the next cycle where positions sync succeeds.
+      this.recorder.runCheckpoint(options.venue, {
+        skippedQuoting: true,
+        protectOnlyMode: true,
+        canceledManagedOrders: replaceCancel.canceledIds.length,
+        plannedIntents: replaceRace.placeable.length
+      });
+      this.stage(options.venue, 'idle', `持仓接口降级,本轮已维护现有挂单(撤 ${replaceCancel.canceledIds.length} 单),跳过新挂单`, {
+        protectOnly: true,
+        canceledManagedOrders: replaceCancel.canceledIds.length,
+        deferredPlacements: replaceRace.placeable.length
+      });
+      return {
+        skippedQuoting: true,
+        protectOnly: true,
+        canceledManagedOrders: replaceCancel.canceledIds.length
+      };
     }
     const quoteCycle = await this.quoteCycleService.process({
       venue: options.venue,
