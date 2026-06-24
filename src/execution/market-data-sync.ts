@@ -24,6 +24,7 @@ const marketCache = new Map<string, { ts: number; markets: Market[] }>();
 const marketInflight = new Map<string, Promise<Market[]>>();
 const orderbookCache = new Map<string, Map<string, Orderbook>>();
 const ORDERBOOK_SYNC_CONCURRENCY = 8;
+const BULK_ORDERBOOK_SYNC_TIMEOUT_MS = 30_000;
 const MARKET_REFRESH_TIMEOUT_MS = 12000;
 const ORDERBOOK_SYNC_TIMEOUT_MS = 8000;
 const MIN_ROUTE_ORDERBOOK_CACHE_TTL_MS = 15000;
@@ -168,9 +169,12 @@ export class MarketDataSyncService {
         .map((market) => market.tokenId);
       if (tokensNeedingFetch.length > 0) {
         try {
+          // Bulk gets its own (larger) timeout because it does many sequential HTTP throttles inside one call —
+          // 47 batches × 120ms throttle ≈ 5.6s of mandated waiting before any work. 30s comfortably absorbs the
+          // throttle + network for a full-universe sweep while still well under the 45s slow-cycle guard.
           const batch = await withTimeout(
             this.adapter.getOrderbooksBatch(tokensNeedingFetch),
-            ORDERBOOK_SYNC_TIMEOUT_MS,
+            BULK_ORDERBOOK_SYNC_TIMEOUT_MS,
             `bulk orderbooks (${tokensNeedingFetch.length} tokens)`
           );
           for (const [id, book] of batch) bulkBooks.set(id, book);

@@ -93,10 +93,34 @@ describe('PolymarketVenue.getOrderbooksBatch — POST /books', () => {
     expect(body).toEqual([{ token_id: 'dup' }]);
   });
 
-  it('throws on HTTP error so the caller can fall back to single /book', async () => {
-    fetchMock.mockResolvedValueOnce(new Response('forbidden', { status: 403 }));
+  it('swallows per-batch HTTP errors and returns a partial Map (caller falls back per missing token)', async () => {
+    // Three batches: first OK, second 403, third OK → result Map has tokens from #1 and #3 only, no throw.
+    const tokensPerBatch = 20;
+    const batch1 = Array.from({ length: tokensPerBatch }, (_, i) => `b1-${i}`);
+    const batch2 = Array.from({ length: tokensPerBatch }, (_, i) => `b2-${i}`);
+    const batch3 = ['b3-0'];
+    const tokens = [...batch1, ...batch2, ...batch3];
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '[]'));
+      const ids = body.map((b: { token_id: string }) => b.token_id);
+      if (ids.includes('b2-0')) return Promise.resolve(new Response('forbidden', { status: 403 }));
+      return Promise.resolve(jsonResponse(ids.map((id: string) => ({
+        asset_id: id, bids: [{ price: '0.5', size: '10' }], asks: []
+      }))));
+    });
     const venue = new PolymarketVenue(config);
-    await expect(venue.getOrderbooksBatch(['tokX'])).rejects.toThrow(/HTTP 403/);
+    const books = await venue.getOrderbooksBatch(tokens);
+    expect(books.size).toBe(batch1.length + batch3.length); // 21
+    expect(books.has('b1-0')).toBe(true);
+    expect(books.has('b2-0')).toBe(false); // failed batch, fell through silently
+    expect(books.has('b3-0')).toBe(true);
+  });
+
+  it('returns an empty Map when every batch fails (caller falls back single-fetch for all tokens)', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(new Response('forbidden', { status: 403 })));
+    const venue = new PolymarketVenue(config);
+    const books = await venue.getOrderbooksBatch(['tokX', 'tokY']);
+    expect(books.size).toBe(0);
   });
 
   it('returns an empty Map for empty / falsy-token input without hitting the network', async () => {

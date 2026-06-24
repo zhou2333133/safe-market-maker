@@ -37,6 +37,10 @@ const POLYMARKET_SAMPLING_MAX_PAGES = 12;
 // Bulk orderbook fetch batch size (POST /books). Empirically reliable up to ~20-30; 20 keeps a comfortable margin
 // against per-request body limits and 403 spikes seen with larger payloads.
 const POLYMARKET_BOOKS_BATCH_SIZE = 20;
+// How many /books batches we send in parallel. Each batch is one POST; 5 parallel × ~250ms = ~1.3s per "round"
+// of 100 tokens, so a full 941-market sweep (~47 batches) completes in ~12s — well inside the 45s cycle guard
+// and the 8s per-call timeout. Higher concurrency risks tripping Polymarket's per-IP throttle.
+const POLYMARKET_BOOKS_BATCH_CONCURRENCY = 5;
 export const POLYMARKET_PUSD = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
 export const POLYMARKET_EXCHANGE_V2 = '0xE111180000d2663C0091e4f400237545B87B996B';
 export const POLYMARKET_NEG_RISK_EXCHANGE_V2 = '0xe2222d279d744050d28e00520010520000310F59';
@@ -312,26 +316,41 @@ export class PolymarketVenue implements VenueAdapter {
     const results = new Map<string, Orderbook>();
     if (unique.length === 0) return results;
     const url = `${this.config.venues.polymarket.clobUrl.replace(/\/+$/, '')}/books`;
+    // Slice into bounded batches, then run several batches in parallel. Each batch has its own try/catch so a
+    // transient HTTP failure on one batch drops only that slice (caller falls back to single /book for those
+    // tokens) — partial success is preserved instead of throwing away the work the other batches did.
+    const batches: string[][] = [];
     for (let i = 0; i < unique.length; i += POLYMARKET_BOOKS_BATCH_SIZE) {
-      const batch = unique.slice(i, i + POLYMARKET_BOOKS_BATCH_SIZE);
-      const body = JSON.stringify(batch.map((tokenId) => ({ token_id: tokenId })));
-      const payload = await httpJson<any>(url, { method: 'POST', body });
-      // /books returns either a top-level array of book objects, OR an object with a `books`/`data` field. Be
-      // generous in what we accept so future minor schema tweaks don't break the parse.
-      const items: any[] = Array.isArray(payload)
-        ? payload
-        : Array.isArray(payload?.books)
-          ? payload.books
-          : Array.isArray(payload?.data)
-            ? payload.data
-            : [];
-      for (const item of items) {
-        const id = String(item?.asset_id ?? item?.token_id ?? item?.tokenId ?? '');
-        if (!id) continue;
-        if (!Array.isArray(item?.bids) && !Array.isArray(item?.asks)) continue;
-        results.set(id, buildOrderbook(this.name, id, item));
-      }
+      batches.push(unique.slice(i, i + POLYMARKET_BOOKS_BATCH_SIZE));
     }
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(POLYMARKET_BOOKS_BATCH_CONCURRENCY, batches.length) }, async () => {
+      while (cursor < batches.length) {
+        const idx = cursor;
+        cursor += 1;
+        const batch = batches[idx]!;
+        try {
+          const body = JSON.stringify(batch.map((tokenId) => ({ token_id: tokenId })));
+          const payload = await httpJson<any>(url, { method: 'POST', body });
+          // /books returns either a top-level array of book objects, OR an object with a `books`/`data` field. Be
+          // generous in what we accept so future minor schema tweaks don't break the parse.
+          const items: any[] = Array.isArray(payload)
+            ? payload
+            : Array.isArray(payload?.books)
+              ? payload.books
+              : Array.isArray(payload?.data)
+                ? payload.data
+                : [];
+          for (const item of items) {
+            const id = String(item?.asset_id ?? item?.token_id ?? item?.tokenId ?? '');
+            if (!id) continue;
+            if (!Array.isArray(item?.bids) && !Array.isArray(item?.asks)) continue;
+            results.set(id, buildOrderbook(this.name, id, item));
+          }
+        } catch { /* per-batch failure: tokens in this slice fall back to single-fetch in the caller */ }
+      }
+    });
+    await Promise.all(workers);
     return results;
   }
 
