@@ -158,7 +158,25 @@ export function marketEndDecision(config: AppConfig, market: Market, now = Date.
   }
   const msToEnd = endTs - now;
   const common = { endTime: market.endTime, endTimeSource: market.endTimeSource, msToEnd };
-  if (msToEnd <= 0) return block('market-ended', '市场已经到达结束时间，禁止新增挂单并撤掉开放订单', { ...common, cancelOpenOrders: true });
+  if (msToEnd <= 0) {
+    // Polymarket's gamma metadata sometimes carries a stale `endDate` even when the market is still live —
+    // observed today for "Will Sorin Grindeanu be the next Prime Minister of Romania?" which reads as live
+    // ($30k liquidity, $33k 24h vol, updatedAt < 1h ago) but whose endDate is 25 days in the past. When the
+    // venue itself still flags the market as accepting orders, trust that live signal over the stale calendar:
+    // skip the "ended" block and let the rest of the checks (settlement-window etc.) run as usual. If we ever
+    // want a stronger guard we can also cap how stale endDate may be (e.g. reject when > 90 days past), but
+    // the simple acceptingOrders bypass closes the legitimate live-market false-positive without adding noise.
+    if (market.acceptingOrders === true) {
+      return {
+        ok: true,
+        cancelOpenOrders: false,
+        reason: 'ok',
+        message: `endDate ${market.endTime} 已过期 ${formatDuration(-msToEnd)} 但 venue 仍 acceptingOrders=true,信 venue 不信 calendar`,
+        ...common
+      };
+    }
+    return block('market-ended', '市场已经到达结束时间，禁止新增挂单并撤掉开放订单', { ...common, cancelOpenOrders: true });
+  }
   if (msToEnd <= config.risk.settlementCancelOpenOrdersMs) {
     return block('cancel-window', `距离市场结束只剩 ${formatDuration(msToEnd)}，应撤掉开放订单`, { ...common, cancelOpenOrders: true });
   }
