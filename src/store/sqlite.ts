@@ -9,10 +9,11 @@ import { stateStoreSchemaSql } from './schema.js';
 import { configureForensicLog, forensicLogEvent, pruneOldForensicFiles } from '../observability/forensic-log.js';
 
 // Retention windows: events/metrics in SQLite kept for 7d (hot tier, queried by UI + audit), forensic JSONL on disk
-// kept for 30d (cold archive, post-hoc complete record). Without retention the events table grows ~110k/day → 3.8GB
-// in two weeks; forensic at 60MB/day fills 1.8GB in 30d. Both auto-pruned at store-open so a long-running bot self-maintains.
+// kept for 3d (cold archive, post-hoc complete record). Production observed ~1.5GB/day forensic growth (POLY's
+// order.ws-update fires ~2.3k/min and dominates), so 3d ≈ 4.5GB on disk — comfortable. Original 30d was sized
+// against a 60MB/day estimate that's ~25x off. Both auto-pruned at store-open so a long-running bot self-maintains.
 const SQLITE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const FORENSIC_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const FORENSIC_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 
 export class StateStore {
   private readonly db: Database.Database;
