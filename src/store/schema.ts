@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS orders (
   reason TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  raw_json TEXT NOT NULL
+  raw_json TEXT NOT NULL,
+  size_matched REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS positions (

@@ -55,6 +55,27 @@ export class StateStore {
 
   migrate(): void {
     this.db.exec(stateStoreSchemaSql);
+    this.applyAdHocMigrations();
+  }
+
+  /**
+   * Idempotent column-add migrations. SQLite's CREATE TABLE IF NOT EXISTS in schema.sql only fires on FRESH
+   * databases; established installations (the user's 728MB live DB) need ALTER TABLE for new columns. Each
+   * migration checks the actual column list before issuing ALTER so re-running the bot is safe.
+   *
+   * The pattern is intentionally simple — no schema_version table yet (deferred to the broader ARCH-001 work).
+   * Each migration block is a sentence in the schema's life history: state what column we want, check if it's
+   * there, add if not. The cost of `PRAGMA table_info` is negligible (microseconds on a single table).
+   */
+  private applyAdHocMigrations(): void {
+    const ordersCols = new Set(
+      (this.db.prepare(`PRAGMA table_info(orders)`).all() as Array<{ name: string }>).map((r) => r.name)
+    );
+    if (!ordersCols.has('size_matched')) {
+      // Polymarket order updates / WS trades fill this in; existing rows default to 0 which matches the
+      // legacy assumption ("we never see partial fills, so they're either OPEN or CANCELED").
+      this.db.exec(`ALTER TABLE orders ADD COLUMN size_matched REAL NOT NULL DEFAULT 0`);
+    }
   }
 
   recordEvent(input: {
@@ -79,6 +100,11 @@ export class StateStore {
 
   recordPlannedOrder(intent: OrderIntent, mode: ExecutionMode): void {
     this.orders.recordPlannedOrder(intent, mode);
+  }
+
+  /** Apply a partial-or-full fill from a real-time source. Idempotent on `size_matched`. */
+  applyFillSizeUpdate(venue: VenueName, externalId: string, filledSize: number, opts: { fillTs?: number } = {}): boolean {
+    return this.orders.applyFillSizeUpdate(venue, externalId, filledSize, opts);
   }
 
   recordOrderResult(result: OrderResult): void {

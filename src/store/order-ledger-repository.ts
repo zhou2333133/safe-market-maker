@@ -20,6 +20,32 @@ export interface RecentOrder {
 export class OrderLedgerRepository {
   constructor(private readonly db: Database.Database) {}
 
+  /**
+   * Apply a partial-or-full fill from a real-time source (WS user channel) or a REST poll. Idempotent:
+   * - If the order's recorded size_matched is already ≥ filledSize, this is a stale/duplicate event and we
+   *   return false without changing anything.
+   * - Otherwise we update size_matched to the new value AND, if filledSize meets/exceeds the original size,
+   *   transition status to FILLED. Partial fills keep status OPEN/PENDING_OPEN — they're still actively
+   *   resting with reduced remaining quantity.
+   * Returns true when the row was modified, false otherwise (allows callers to dedupe their own bookkeeping).
+   */
+  applyFillSizeUpdate(venue: string, externalId: string, filledSize: number, opts: { fillTs?: number } = {}): boolean {
+    if (!externalId || !Number.isFinite(filledSize) || filledSize <= 0) return false;
+    const row = this.db.prepare(`
+      SELECT client_order_id, size, size_matched, status FROM orders WHERE venue=? AND external_id=?
+    `).get(venue, externalId) as { client_order_id: string; size: number; size_matched: number; status: string } | undefined;
+    if (!row) return false;
+    // Defence against out-of-order WS events: never decrease the matched figure.
+    if (row.size_matched >= filledSize - 1e-9) return false;
+    const becomesFilled = filledSize + 1e-9 >= row.size;
+    const newStatus = becomesFilled ? 'FILLED' : row.status === 'PLANNED' ? 'PARTIALLY_FILLED' : row.status;
+    const now = opts.fillTs ?? Date.now();
+    this.db.prepare(`
+      UPDATE orders SET size_matched=?, status=?, updated_at=? WHERE client_order_id=?
+    `).run(filledSize, newStatus, now, row.client_order_id);
+    return true;
+  }
+
   recordPlannedOrder(intent: OrderIntent, mode: ExecutionMode): void {
     const now = Date.now();
     this.db.prepare(`
@@ -174,13 +200,42 @@ export class OrderLedgerRepository {
     const now = Date.now();
     const remotePlaceholders = remoteIds.size > 0 ? [...remoteIds].map(() => '?').join(',') : "''";
     const remoteArgs = [...remoteIds];
+    // A row that disappears from venue's open list could be EITHER cancelled OR filled. Distinguish via the
+    // size_matched figure (WS / earlier fills mark it on the way down):
+    //   size_matched > 0  → status=FILLED  (the venue took the rest; size_matched may equal `size` exactly or
+    //                       be slightly less due to partial-fill ordering, both are FILLED for our purposes)
+    //   size_matched == 0 → status=CANCELED (we cancelled it, or it was never matched)
+    // Without this distinction the bot has historically labelled every filled order as CANCELED, which is what
+    // hid today's BUY-eat-then-SELL incident from the orders ledger.
+    const markMissingFilled = this.db.prepare(`
+      UPDATE orders
+      SET status='FILLED', updated_at=?
+      WHERE venue=?
+        AND external_id IS NOT NULL
+        AND status='OPEN'
+        AND size_matched > 0
+        AND client_order_id LIKE ?
+        AND external_id NOT IN (${remotePlaceholders})
+    `);
     const markMissingClosed = this.db.prepare(`
       UPDATE orders
       SET status='CANCELED', updated_at=?
       WHERE venue=?
         AND external_id IS NOT NULL
         AND status='OPEN'
+        AND size_matched = 0
         AND client_order_id LIKE ?
+        AND external_id NOT IN (${remotePlaceholders})
+    `);
+    const markMissingManagedFilled = this.db.prepare(`
+      UPDATE orders
+      SET status='FILLED', updated_at=?
+      WHERE venue=?
+        AND external_id IS NOT NULL
+        AND status='OPEN'
+        AND size_matched > 0
+        AND client_order_id NOT LIKE ?
+        AND updated_at <= ?
         AND external_id NOT IN (${remotePlaceholders})
     `);
     const markMissingManagedClosed = this.db.prepare(`
@@ -189,13 +244,16 @@ export class OrderLedgerRepository {
       WHERE venue=?
         AND external_id IS NOT NULL
         AND status='OPEN'
+        AND size_matched = 0
         AND client_order_id NOT LIKE ?
         AND updated_at <= ?
         AND external_id NOT IN (${remotePlaceholders})
     `);
     this.db.transaction(() => {
       this.ingestOpenOrders(remoteOrders, mode);
+      markMissingFilled.run(now, venue, `${venue}:%`, ...remoteArgs);
       markMissingClosed.run(now, venue, `${venue}:%`, ...remoteArgs);
+      markMissingManagedFilled.run(now, venue, `${venue}:%`, now - (options.freshOpenGraceMs ?? 0), ...remoteArgs);
       markMissingManagedClosed.run(now, venue, `${venue}:%`, now - (options.freshOpenGraceMs ?? 0), ...remoteArgs);
     })();
   }

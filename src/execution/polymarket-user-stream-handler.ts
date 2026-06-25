@@ -53,6 +53,21 @@ export class PolymarketUserStreamHandler {
         fillTs: fill.fillTs,
         raw: record
       });
+      // Update the orders ledger so the operator can see the order's size_matched without joining account_fills.
+      // applyFillSizeUpdate is idempotent on size_matched, so duplicate / out-of-order WS events are safe.
+      let orderLedgered = false;
+      if (fill.orderId) {
+        try {
+          orderLedgered = this.store.applyFillSizeUpdate(
+            PolymarketUserStreamHandler.VENUE,
+            fill.orderId,
+            fill.size,
+            { fillTs: fill.fillTs }
+          );
+        } catch {
+          // applyFillSizeUpdate failure must not break the WS leg — account_fills already captured the data.
+        }
+      }
       this.store.recordEvent({
         venue: PolymarketUserStreamHandler.VENUE,
         severity: 'warn',
@@ -66,6 +81,7 @@ export class PolymarketUserStreamHandler {
           price: fill.price,
           size: fill.size,
           notionalUsd: fill.notionalUsd,
+          orderLedgered,
           sourceWireType: String(record.event_type ?? record.type ?? 'trade')
         }
       });
