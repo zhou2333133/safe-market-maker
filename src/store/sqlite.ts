@@ -154,6 +154,12 @@ export class StateStore {
     this.risks.recordAccountRiskSnapshot(snapshot);
   }
 
+  /** Insert a fill the venue WS user channel just pushed; idempotent on (venue, fill_id). See
+   *  RiskRepository.recordWsFill for the WS-vs-REST dual-source semantics. */
+  recordWsFill(row: import('./risk-repository.js').WsFillRow): void {
+    this.risks.recordWsFill(row);
+  }
+
   recordAccountRiskDecision(decision: AccountRiskDecision): void {
     this.risks.recordAccountRiskDecision(decision);
   }

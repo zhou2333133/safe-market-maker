@@ -44,6 +44,18 @@ export interface PolymarketUserChannelState {
   tradeEventsSeq: number;
 }
 
+/**
+ * Callback shape for live account events. The handler receives the raw event record from the venue (we don't try
+ * to flatten it here because Polymarket's wire shape varies across event subtypes), the high-level type, and the
+ * timestamp we received it locally. The handler is expected to be cheap and never throw — exceptions get caught
+ * and recorded by the WS client so a buggy listener can't kill the socket. Returning anything is ignored.
+ */
+export type PolymarketUserEventListener = (
+  type: 'order' | 'trade',
+  record: Record<string, unknown>,
+  receivedAt: number
+) => void;
+
 export class PolymarketWsClient {
   private socket?: WebSocket;
   private connecting?: Promise<void>;
@@ -67,6 +79,14 @@ export class PolymarketWsClient {
    *  receivedAt is older than this is no longer a valid fallback — the underlying market may have moved while the
    *  WS was down and Polymarket will not re-snapshot quiet markets. Reset to 0 on a real WS book push. */
   private primeInvalidatedAt = 0;
+  /** Optional listener that gets called for every order / trade event the venue pushes. The bot uses this to
+   *  ledger fills the moment the venue confirms them — independent of the REST data-api (which is the path that
+   *  intermittently stalls through the user's proxy). */
+  private userEventListener?: PolymarketUserEventListener;
+  /** Timestamp of the most recent user-channel disconnect; bot uses this to know it should force a REST reconcile
+   *  on the next cycle (because the WS may have missed fills during the gap). 0 means "no disconnect since last
+   *  successful subscribe", i.e. WS-stream-only is authoritative. */
+  private userDisconnectedAt = 0;
   private readonly userEvents: Array<{ type: string; data: unknown; receivedAt: number }> = [];
 
   constructor(private readonly wsUrl: string) {}
@@ -203,6 +223,29 @@ export class PolymarketWsClient {
     return this.userEvents.slice(-limit);
   }
 
+  /** Register the listener that consumes every order/trade event the user channel pushes. Calling this with the
+   *  same listener twice is a no-op; passing undefined clears the listener. The listener fires for every event
+   *  including events received between subscribe and the listener being registered (we replay the buffered ones
+   *  so a startup race doesn't lose fills). */
+  setUserEventListener(listener: PolymarketUserEventListener | undefined): void {
+    const previous = this.userEventListener;
+    this.userEventListener = listener;
+    if (!listener || listener === previous) return;
+    // Replay buffered events so a listener registered just after subscribe doesn't miss the fills that arrived
+    // in the small interval before. The buffer is short (300) so the cost is bounded.
+    for (const evt of this.userEvents) {
+      if (evt.type !== 'order' && evt.type !== 'trade') continue;
+      try { listener(evt.type as 'order' | 'trade', evt.data as Record<string, unknown>, evt.receivedAt); }
+      catch { /* a buggy listener must not kill our socket; the event stays buffered for diagnostics */ }
+    }
+  }
+
+  /** True if the user channel saw a disconnect since the last subscribe success. The caller (engine) uses this to
+   *  force a one-shot REST account-state reconcile on the next cycle as a belt-and-suspenders against fills that
+   *  may have happened during the gap. After the engine acknowledges via consumeUserDisconnectedFlag(), this clears. */
+  hasUserDisconnectedSinceLastConsume(): boolean { return this.userDisconnectedAt > 0; }
+  consumeUserDisconnectedFlag(): number { const ts = this.userDisconnectedAt; this.userDisconnectedAt = 0; return ts; }
+
   /** Health + event sequence numbers for the user channel — used to serve/invalidate REST account-state caches. */
   userChannelState(): PolymarketUserChannelState {
     const healthy = this.userSocket?.readyState === WebSocket.OPEN
@@ -268,6 +311,10 @@ export class PolymarketWsClient {
     this.userSocket = undefined;
     this.userConnecting = undefined;
     this.userSubscribed = false;
+    // Mark the disconnect timestamp so the engine knows to force one REST reconcile next cycle — without this
+    // flag, fills delivered while the user socket was down would never make it into the ledger (REST account-
+    // snapshot may also have been stalling in the same outage window).
+    this.userDisconnectedAt = Date.now();
     if (this.userPingTimer) {
       clearInterval(this.userPingTimer);
       this.userPingTimer = undefined;
@@ -279,6 +326,7 @@ export class PolymarketWsClient {
     const parsed = safeJson(data.toString());
     if (!parsed) return;
     const events = Array.isArray(parsed) ? parsed : [parsed];
+    const now = Date.now();
     for (const event of events) {
       if (!event || typeof event !== 'object') continue;
       const record = event as Record<string, unknown>;
@@ -286,8 +334,15 @@ export class PolymarketWsClient {
       if (type !== 'order' && type !== 'trade') continue;
       this.accountEventsSeq += 1;
       if (type === 'trade') this.tradeEventsSeq += 1;
-      this.userEvents.push({ type, data: record, receivedAt: Date.now() });
+      this.userEvents.push({ type, data: record, receivedAt: now });
       if (this.userEvents.length > 300) this.userEvents.splice(0, this.userEvents.length - 300);
+      // Notify the registered listener (engine layer) so it can ledger the fill immediately. Wrapped in try/catch
+      // so a buggy handler can't tear down the WS reader loop — losing telemetry is preferable to losing the
+      // socket and going dark on subsequent fills.
+      if (this.userEventListener) {
+        try { this.userEventListener(type as 'order' | 'trade', record, now); }
+        catch { /* swallow — event remains in userEvents buffer for forensic inspection */ }
+      }
     }
   }
 

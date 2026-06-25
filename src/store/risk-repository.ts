@@ -27,11 +27,59 @@ export interface AccountEquityPoint {
   equityUsd: number;
 }
 
+export interface WsFillRow {
+  venue: VenueName;
+  fillId: string;
+  orderId?: string | null;
+  tokenId?: string | null;
+  marketId?: string | null;
+  side?: string | null;
+  price?: number | null;
+  size?: number | null;
+  notionalUsd: number;
+  feeUsd?: number | null;
+  fillTs: number;
+  raw: unknown;
+}
+
 export class RiskRepository {
   constructor(
     private readonly db: Database.Database,
     private readonly observability: Pick<ObservabilityRepository, 'checkpoint'>
   ) {}
+
+  /**
+   * Write a fill the venue WS user channel just pushed. Uses INSERT OR IGNORE on the (venue, fill_id) primary key
+   * so a later REST account-risk snapshot — which usually has richer fields (realized PnL, cashflow, fees) —
+   * naturally enriches the same row via ON CONFLICT DO UPDATE in recordAccountRiskSnapshot. WS-only data never
+   * overwrites a row REST already enriched. This is the WS-leg of the dual-source ledger: WS is fast (arrives
+   * within ~1s of fill), REST is authoritative (carries the on-chain settled figures).
+   */
+  recordWsFill(row: WsFillRow): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO account_fills (
+        venue, fill_id, order_id, token_id, market_id, side, price, size,
+        notional_usd, fee_usd, realized_pnl_usd, cashflow_usd, fill_ts, raw_json
+      )
+      VALUES (
+        @venue, @fill_id, @order_id, @token_id, @market_id, @side, @price, @size,
+        @notional_usd, @fee_usd, NULL, NULL, @fill_ts, @raw_json
+      )
+    `).run({
+      venue: row.venue,
+      fill_id: row.fillId,
+      order_id: row.orderId ?? null,
+      token_id: row.tokenId ?? null,
+      market_id: row.marketId ?? null,
+      side: row.side ?? null,
+      price: Number.isFinite(row.price) ? row.price : null,
+      size: Number.isFinite(row.size) ? row.size : null,
+      notional_usd: Number.isFinite(row.notionalUsd) ? row.notionalUsd : 0,
+      fee_usd: Number.isFinite(row.feeUsd) ? row.feeUsd : null,
+      fill_ts: row.fillTs,
+      raw_json: JSON.stringify(redact(row.raw ?? row))
+    });
+  }
 
   recordAccountRiskSnapshot(snapshot: AccountRiskSnapshot): void {
     const insertFill = this.db.prepare(`

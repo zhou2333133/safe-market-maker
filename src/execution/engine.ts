@@ -20,6 +20,7 @@ import { QuoteCycleService } from './quote-cycle-service.js';
 import { SplitEntryService } from './split-entry-service.js';
 import { accountRiskWindowStart } from '../risk/risk-window.js';
 import { evaluateAccountRisk } from '../risk/account-risk.js';
+import { PolymarketUserStreamHandler } from './polymarket-user-stream-handler.js';
 
 const CASH_NEW_ORDER_PAUSE_CHECKPOINT_PREFIX = 'cash-new-order-pause';
 const KILL_EXIT_MAX_ATTEMPTS = 8;
@@ -95,11 +96,32 @@ export class ExecutionEngine {
     this.recorder = new ExecutionRecorder(store);
     this.quoteCycleService = new QuoteCycleService(config, adapter, store);
     this.splitEntryService = new SplitEntryService(config, adapter, store);
+    // Wire the Polymarket user-channel WS event handler. The adapter's `setUserEventListener` is optional —
+    // Predict has no such channel today, so its adapter leaves the method undefined and the engine just doesn't
+    // register anything. POLY-only side-effect.
+    if (typeof this.adapter.setUserEventListener === 'function') {
+      const handler = new PolymarketUserStreamHandler(this.store);
+      this.adapter.setUserEventListener(handler.handle.bind(handler));
+    }
   }
 
   async runOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     const signerAddress = options.signer.address;
     const dayStart = accountRiskWindowStart(options.venue, this.store);
+    // WS user-channel reconcile: if the user channel disconnected since last cycle, record an event so the
+    // operator sees the gap and the next REST account-risk snapshot acts as the catch-up. We don't force any
+    // additional REST call here because the cycle already pulls open-orders + positions + risk snapshot below;
+    // those pulls will surface any fills that arrived during the gap (REST is the belt-and-suspenders).
+    const disconnectedAt = this.adapter.consumeUserChannelDisconnectFlag?.() ?? 0;
+    if (disconnectedAt > 0) {
+      this.store.recordEvent({
+        venue: options.venue,
+        severity: 'warn',
+        type: 'user-channel.disconnect-detected',
+        message: `检测到 WS user channel 断开过(${new Date(disconnectedAt).toISOString()}),本轮 REST 同步将作为兜底补漏`,
+        details: { disconnectedAt }
+      });
+    }
     this.stage(options.venue, 'syncing-orders', '同步平台开放订单');
     let openOrders: OpenOrder[];
     if (options.fast) {

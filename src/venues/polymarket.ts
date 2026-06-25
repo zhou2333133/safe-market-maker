@@ -369,6 +369,20 @@ export class PolymarketVenue implements VenueAdapter {
     return this.wsClient().recentUserEvents(limit);
   }
 
+  /** Engine-layer hook for "venue pushed me a fill, ledger it now". The listener fires for every order / trade
+   *  event the user channel delivers, including buffered events that arrived before the listener was registered
+   *  (so a startup race doesn't lose fills). Passing undefined clears the listener. */
+  setUserEventListener(listener: import('./polymarket-ws.js').PolymarketUserEventListener | undefined): void {
+    this.wsClient().setUserEventListener(listener);
+  }
+
+  /** True if the user channel disconnected since the engine last consumed the flag. The engine reads this each
+   *  cycle and, when true, forces a REST account-state reconcile as a belt-and-suspenders catch-up for fills that
+   *  may have arrived while the WS was down. */
+  consumeUserChannelDisconnectFlag(): number {
+    return this.wsClient().consumeUserDisconnectedFlag();
+  }
+
   private wsClient(): PolymarketWsClient {
     const url = this.config.venues.polymarket.wsUrl;
     let client = PolymarketVenue.wsClients.get(url);

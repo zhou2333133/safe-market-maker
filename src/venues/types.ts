@@ -82,6 +82,19 @@ export interface VenueAdapter {
    * empty / partial Map for some tokens MUST fall back to single getOrderbook / getOrderbookRest for the missing
    * ones, so the scan never degrades silently. Predict has no equivalent endpoint and leaves this undefined. */
   getOrderbooksBatch?(tokenIds: string[]): Promise<Map<string, Orderbook>>;
+  /** OPTIONAL: register a listener that receives real-time order / trade events the venue pushes over its user
+   *  channel WS. The bot uses this to ledger fills the moment the venue confirms them, independent of REST
+   *  account-state pulls. Predict has no such channel today and leaves this undefined; the engine's REST
+   *  reconcile path is the sole source of truth there. */
+  setUserEventListener?(listener: (
+    type: 'order' | 'trade',
+    record: Record<string, unknown>,
+    receivedAt: number
+  ) => void | undefined): void;
+  /** OPTIONAL paired with setUserEventListener: returns >0 if the user channel disconnected since the engine last
+   *  consumed this flag, and 0 otherwise. The engine reads it once per cycle to decide whether to force a REST
+   *  account-state reconcile (catching fills that may have happened during the gap). */
+  consumeUserChannelDisconnectFlag?(): number;
   getBalances(address: string, signer?: SignerProvider): Promise<Balance[]>;
   getPositions(address: string): Promise<Position[]>;
   getOpenOrders(address: string): Promise<OpenOrder[]>;
