@@ -10,6 +10,14 @@ import type { VenueAdapter } from '../venues/types.js';
 
 const EPSILON = 1e-9;
 const CASH_DUST_NOTIONAL_USD = 0.01;
+/**
+ * After a successful exit submit for a given (venue, tokenId), suppress further exit attempts for this window.
+ * This is what prevents the "balance: 0" log noise: when the venue's position API takes ~5-15s to reflect that
+ * the exit cleared the position, the next cycle's fill-circuit-breaker would otherwise re-fire and submit a
+ * duplicate SELL that the venue rightly rejects (no shares to sell). 30s is long enough to bridge data-api lag,
+ * short enough that a real new fill on the same token gets exited promptly.
+ */
+const RECENT_EXIT_SUPPRESS_MS = 30_000;
 
 export interface CashFillExitResult {
   attempted: boolean;
@@ -29,11 +37,33 @@ export interface CashFillExitInput {
 }
 
 export class CashFillExitService {
+  /**
+   * In-process idempotency cache: maps `${venue}:${tokenId}` to the timestamp of the most recent successful
+   * exit submission. Read at the top of `process()` to suppress duplicate exits within RECENT_EXIT_SUPPRESS_MS.
+   * Restart loses the cache, which is fine — a fresh process will see fresh positions from REST and the brief
+   * window for a true duplicate is essentially nil right after startup.
+   */
+  private readonly recentExitSubmittedAt = new Map<string, number>();
+
   constructor(
     private readonly config: AppConfig,
     private readonly adapter: VenueAdapter,
     private readonly store: StateStore
   ) {}
+
+  private exitCacheKey(venue: VenueName, tokenId: string): string {
+    return `${venue}:${tokenId}`;
+  }
+
+  private isExitRecentlySubmitted(venue: VenueName, tokenId: string): boolean {
+    const ts = this.recentExitSubmittedAt.get(this.exitCacheKey(venue, tokenId));
+    if (!ts) return false;
+    return Date.now() - ts < RECENT_EXIT_SUPPRESS_MS;
+  }
+
+  private markExitSubmitted(venue: VenueName, tokenId: string): void {
+    this.recentExitSubmittedAt.set(this.exitCacheKey(venue, tokenId), Date.now());
+  }
 
   async process(input: CashFillExitInput): Promise<CashFillExitResult> {
     if (!input.force && !shouldCashExit(this.config, input.venue)) return { attempted: false, submitted: 0, blocked: 0, failed: 0 };
@@ -55,6 +85,21 @@ export class CashFillExitService {
     let blocked = 0;
     let failed = 0;
     for (const position of positions) {
+      // Idempotency guard: if we successfully submitted an exit for this token within the last
+      // RECENT_EXIT_SUPPRESS_MS, the venue's position API is just slow to reflect that the position cleared.
+      // Skipping the second submit prevents the "balance: 0" failure log noise and avoids accidentally
+      // double-trading should the venue's pre-validation lag mistakenly accept the duplicate.
+      if (this.isExitRecentlySubmitted(input.venue, position.tokenId)) {
+        blocked += 1;
+        this.store.recordEvent({
+          venue: input.venue,
+          severity: 'info',
+          type: 'cash-fill.exit-skipped-duplicate',
+          message: `现金单边平仓已在 ${Math.round(RECENT_EXIT_SUPPRESS_MS / 1000)}s 内提交过(等 venue 同步持仓),跳过重复提交`,
+          details: { position: publicPosition(position), suppressWindowMs: RECENT_EXIT_SUPPRESS_MS }
+        });
+        continue;
+      }
       const market = position.market ?? marketByToken.get(position.tokenId);
       if (!market) {
         blocked += 1;
@@ -100,6 +145,7 @@ export class CashFillExitService {
       try {
         const result = await this.adapter.createMarketableOrder(plan.intent, input.signer);
         submitted += 1;
+        this.markExitSubmitted(input.venue, position.tokenId);
         this.store.recordOrderResult(result);
         this.store.recordEvent({
           venue: input.venue,

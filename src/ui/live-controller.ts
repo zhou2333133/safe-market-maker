@@ -426,7 +426,13 @@ export function isRetryableLiveLoopError(error: unknown): boolean {
     '订单簿',
     '盘口读取',
     'market list',
-    '市场列表'
+    '市场列表',
+    // Polymarket clob-client raises "service not ready" when its internal initialization state has drifted
+    // (typically after a long-running session where the SDK's cached server-time clock skews far enough that
+    // signed messages fail the venue's freshness check). Subsequent calls succeed once the SDK re-syncs on the
+    // next request — so this MUST be retryable, not a loop-killer. The Jun 25 04:45 incident froze POLY for
+    // 2.5 hours because this string wasn't in the list.
+    'service not ready'
   ].some((needle) => lower.includes(needle));
 }
 
