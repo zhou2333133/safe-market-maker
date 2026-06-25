@@ -42,6 +42,10 @@ const FAST_REPLACE_URGENT_DRIFT_TICKS = 2;
 // GTD dead-man switch: refresh (re-place with a fresh expiry) an order once it is within this many seconds of its
 // expiry, so resting orders never lapse during normal operation while still auto-cancelling if the bot/network dies.
 const GTD_REFRESH_BUFFER_SEC = 25;
+// REST-verify timeout for the naked-rest cancel path. Capped well below the fast-tick interval so a slow REST
+// can't drag the cycle past its 45s timeout — on timeout we fall back to the original "panic cancel" behaviour
+// so safety is never reduced versus the pre-fix code, only improved when the network responds in time.
+const NAKED_REST_REST_VERIFY_TIMEOUT_MS = 2000;
 
 interface CashMaintenanceStaleEntry {
   orderId: string;
@@ -97,6 +101,59 @@ export class CancelService {
       details: { ids: uniqueIds, reasons, semantics: cancelSemantics(venue) }
     });
     return openOrders.filter((order) => !uniqueIds.includes(order.externalId));
+  }
+
+  /**
+   * Last-ditch verification before the long-naked-rest panic cancel fires. Pulls a one-shot REST orderbook for
+   * the order's token and re-runs `shouldRetreatThinFront` on it. Returns:
+   *   - `keep: true`  — the book is fresh AND depth still meets the retreat floor → don't cancel
+   *   - `keep: false, verified: true` — book is fresh and depth has actually eroded → cancel for the real reason
+   *   - `keep: false, verified: false` — REST itself failed/timed out → cancel (preserves original safety,
+   *                                       caller fires `quote.protect-rest-verify-failed` event for visibility)
+   *
+   * As a side effect, a successful REST fetch is written into the per-cycle `books` Map AND primed back into
+   * the WS cache so subsequent fast-ticks reuse it — this is the multiplier that makes the REST cost amortise.
+   */
+  private async verifyNakedOrderViaRest(
+    venue: VenueName,
+    order: OpenOrder,
+    market: Market,
+    books: Map<string, Orderbook>
+  ): Promise<{ keep: boolean; verified: boolean; reason: string }> {
+    if (typeof this.adapter.getOrderbook !== 'function') {
+      return { keep: false, verified: false, reason: 'adapter 不支持 REST 盘口拉取,回退到原裸奔撤单' };
+    }
+    let freshBook: Orderbook;
+    try {
+      freshBook = await withCancelServiceTimeout(
+        this.adapter.getOrderbook(order.tokenId),
+        NAKED_REST_REST_VERIFY_TIMEOUT_MS,
+        `naked-rest verify ${order.tokenId}`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { keep: false, verified: false, reason: `REST 验证失败(${message.slice(0, 80)}),回退到原裸奔撤单` };
+    }
+    if (!freshBook || (freshBook.bids?.length ?? 0) === 0 && (freshBook.asks?.length ?? 0) === 0) {
+      return { keep: false, verified: false, reason: 'REST 返回空 book,无法验证,回退到原裸奔撤单' };
+    }
+    // Side-effect: stash the fresh book so downstream checks in this cycle see it, and prime the WS cache for
+    // future ticks. Both are best-effort — if primeBook isn't implemented we just skip it.
+    books.set(order.tokenId, freshBook);
+    try { this.adapter.primeBook?.(order.tokenId, freshBook); } catch { /* best effort */ }
+    const retreat = shouldRetreatThinFront(this.config, venue, order, market, freshBook);
+    if (!retreat) {
+      return { keep: true, verified: true, reason: `REST 验证盘口仍健康(book age ${Date.now() - freshBook.receivedAt}ms),保留挂单` };
+    }
+    const reasons: string[] = [];
+    if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
+      reasons.push(`前方保护深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
+    }
+    if (retreat.supportShortfall) {
+      const s = retreat.supportShortfall;
+      reasons.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)}(${s.windowCents}¢ 窗口内)< $${s.requiredUsd}`);
+    }
+    return { keep: false, verified: true, reason: `REST 验证后确认不安全:${reasons.join(' + ')},撤单避免被吃` };
   }
 
   async cancelReplaceableOrders(
@@ -160,14 +217,44 @@ export class CancelService {
       const orderAgeMs = order.placedAt ? Date.now() - order.placedAt : 0;
       const longNakedRest = orderAgeMs > 30_000;
       if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
-        cancelIds.add(order.externalId);
-        cancelReasons.push({
-          orderId: order.externalId,
-          tokenId: order.tokenId,
-          side: order.side,
-          reason: `保护盘口不可用(${!book ? '无缓存' : '陈旧 ' + Math.max(0, Date.now() - book.receivedAt) + 'ms'})，无法验证 3 道保护，立即撤单避免裸奔`
-        });
-        continue;
+        // Before the safety cancel fires, try ONE bounded REST fetch to get a fresh book and re-run the same
+        // depth checks that shouldRetreatThinFront would have run. Three outcomes:
+        //   (a) REST returns a healthy book → keep the order, prime the WS cache so the next ticks reuse it.
+        //   (b) REST returns a book that actually shows retreat conditions → cancel for the real reason.
+        //   (c) REST fails / times out → fall back to the original panic cancel (safety never reduced).
+        // This kills the "no WS push for quiet markets" false-cancel pattern that ate ~240 Predict cancels/day
+        // without weakening the POLY @ 0.437 protection the longNakedRest check was originally added for.
+        const verifyResult = await this.verifyNakedOrderViaRest(venue, order, market, books);
+        if (verifyResult.keep) {
+          // The freshly fetched book is also stashed back into `books` so any downstream checks in this same
+          // cycle (replace decision, GTD refresh) see it as fresh — they share the same Map by reference.
+          this.store.recordEvent({
+            venue,
+            severity: 'info',
+            type: 'quote.protect-rest-verify-kept',
+            message: `REST 验证盘口仍健康,保留 ${order.externalId.slice(0, 18)}…`,
+            details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: verifyResult.reason }
+          });
+          // Fall through to subsequent checks (shouldRetreatThinFront / replace decision) using the fresh book.
+        } else {
+          cancelIds.add(order.externalId);
+          cancelReasons.push({
+            orderId: order.externalId,
+            tokenId: order.tokenId,
+            side: order.side,
+            reason: verifyResult.reason
+          });
+          this.store.recordEvent({
+            venue,
+            severity: verifyResult.verified ? 'warn' : 'info',
+            type: verifyResult.verified ? 'quote.protect-rest-verify-canceled' : 'quote.protect-rest-verify-failed',
+            message: verifyResult.verified
+              ? `REST 验证后真的不安全,撤 ${order.externalId.slice(0, 18)}…`
+              : `REST 验证调用失败,回退到原裸奔撤单 ${order.externalId.slice(0, 18)}…`,
+            details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: verifyResult.reason }
+          });
+          continue;
+        }
       }
       const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
       if (retreat) {
@@ -754,4 +841,24 @@ export function updateExitLiquidityCooldown(
     cooldownMs,
     entries,
   });
+}
+
+
+/**
+ * Inline copy of market-data-sync.ts's withTimeout. Kept private here so the cancel-service has zero new
+ * imports — the existing module has no relationship with market-data-sync and we want to keep it that way to
+ * avoid even a hint of a circular dependency. Function body is identical; cost of the duplication is 8 lines.
+ */
+async function withCancelServiceTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
