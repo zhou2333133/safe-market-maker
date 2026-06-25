@@ -133,6 +133,94 @@ describe('CashFillExitService — idempotent exits (Bug C fix)', () => {
     expect(adapter.createMarketableOrder).toHaveBeenCalledTimes(2);
     expect(result.submitted).toBe(1);
   });
+
+  it('CONCURRENT cycles: cache mark precedes the submit await so a second call cannot duplicate (production race fix)', async () => {
+    // Production race observed 2026-06-25 12:43:25 → 12:43:33: two SELL submits 8s apart, second failed with
+    // "balance: 0" because the first had already cleared the venue position. Root cause: markExitSubmitted ran
+    // AFTER the await, so a parallel cycle entering process() during the in-flight submit found cache=unmarked
+    // and issued a duplicate. Fix: mark BEFORE the await. This test holds the first submit pending while a
+    // second process() runs and asserts only ONE createMarketableOrder call happens.
+    const store = makeStore();
+    let resolveFirstSubmit: ((value: OrderResult) => void) | undefined;
+    const adapter = {
+      createMarketableOrder: vi.fn(() => new Promise<OrderResult>((resolve) => {
+        resolveFirstSubmit = resolve;
+      })),
+      getOrderbook: vi.fn(async () => ({
+        venue: 'polymarket' as const,
+        tokenId: 'tokA',
+        bids: [{ price: 0.6, size: 500 }, { price: 0.59, size: 300 }],
+        asks: [{ price: 0.61, size: 200 }],
+        receivedAt: Date.now()
+      } satisfies Orderbook))
+    } as any;
+    const svc = new CashFillExitService(config, adapter, store);
+    const args = {
+      venue: 'polymarket' as const,
+      signer: { address: '0x1' } as any,
+      positions: [makePosition()],
+      openOrders: [],
+      markets: [makeMarket()],
+      force: true as const
+    };
+
+    // Start the first process() — it hits the cache mark synchronously and then awaits createMarketableOrder.
+    const firstCall = svc.process(args);
+    // Drain the microtask queue so the first call has progressed to the await before we start the second.
+    await new Promise((r) => setImmediate(r));
+    // Start the second process() while the first await is still pending.
+    const secondCall = svc.process(args);
+    // Now let the first submit resolve.
+    resolveFirstSubmit!({
+      venue: 'polymarket', clientOrderId: 'cid1', externalId: '0xfill1', status: 'FILLED', raw: {}
+    } satisfies OrderResult);
+
+    const [r1, r2] = await Promise.all([firstCall, secondCall]);
+
+    // The invariant: only ONE submit, no matter how concurrent the cycles are.
+    expect(adapter.createMarketableOrder).toHaveBeenCalledTimes(1);
+    expect(r1.submitted).toBe(1);
+    expect(r2.submitted).toBe(0);
+    expect(r2.blocked).toBe(1);
+    const skipEvt = store.recordEvent.mock.calls.find((c: any) => c[0].type === 'cash-fill.exit-skipped-duplicate');
+    expect(skipEvt).toBeDefined();
+  });
+
+  it('FAILED first submit also marks the cache so a second call within 30s does not hammer the venue', async () => {
+    // Without this property, a failing submit (e.g. venue 5xx, insufficient balance) would invite a tight retry
+    // loop on every subsequent cycle until the position changed. The 30s back-off lets the venue settle and
+    // surfaces the underlying problem to the operator instead of burying it in retry noise.
+    const store = makeStore();
+    const adapter = {
+      createMarketableOrder: vi.fn(async () => { throw new Error('venue: 503 service unavailable'); }),
+      getOrderbook: vi.fn(async () => ({
+        venue: 'polymarket' as const,
+        tokenId: 'tokA',
+        bids: [{ price: 0.6, size: 500 }],
+        asks: [{ price: 0.61, size: 200 }],
+        receivedAt: Date.now()
+      } satisfies Orderbook))
+    } as any;
+    const svc = new CashFillExitService(config, adapter, store);
+    const args = {
+      venue: 'polymarket' as const,
+      signer: { address: '0x1' } as any,
+      positions: [makePosition()],
+      openOrders: [],
+      markets: [makeMarket()],
+      force: true as const
+    };
+
+    const r1 = await svc.process(args);
+    expect(r1.failed).toBe(1);
+    expect(adapter.createMarketableOrder).toHaveBeenCalledTimes(1);
+
+    // Second call within 30s — must NOT retry; cache mark survives the failure.
+    const r2 = await svc.process(args);
+    expect(adapter.createMarketableOrder).toHaveBeenCalledTimes(1); // still 1
+    expect(r2.blocked).toBe(1);
+    expect(r2.failed).toBe(0);
+  });
 });
 
 describe('isRetryableLiveLoopError — "service not ready" is now retryable (Bug D fix)', () => {

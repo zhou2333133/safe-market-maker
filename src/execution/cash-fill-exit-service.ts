@@ -11,11 +11,17 @@ import type { VenueAdapter } from '../venues/types.js';
 const EPSILON = 1e-9;
 const CASH_DUST_NOTIONAL_USD = 0.01;
 /**
- * After a successful exit submit for a given (venue, tokenId), suppress further exit attempts for this window.
- * This is what prevents the "balance: 0" log noise: when the venue's position API takes ~5-15s to reflect that
- * the exit cleared the position, the next cycle's fill-circuit-breaker would otherwise re-fire and submit a
- * duplicate SELL that the venue rightly rejects (no shares to sell). 30s is long enough to bridge data-api lag,
- * short enough that a real new fill on the same token gets exited promptly.
+ * Once an exit has been ATTEMPTED for a given (venue, tokenId), suppress further exit attempts for this window.
+ * The cache mark is set BEFORE awaiting createMarketableOrder, not after — observed in production on 2026-06-25:
+ * a concurrent cycle entered process() while the first call's ~5s submit await was still in flight, found the
+ * cache unmarked, and issued a duplicate marketable SELL that the venue then rejected with "balance: 0" because
+ * the first SELL had already cleared the venue-side position. Marking before the await closes that race.
+ *
+ * Persisting the mark across FAILURE is intentional — if the first submit failed for a real reason (insufficient
+ * balance, geo-block, venue 5xx) the 30s back-off prevents a tight retry loop hammering the venue. A fresh fill
+ * on the same token after 30s clears the guard naturally for legitimate retry. 30s is also long enough to bridge
+ * the venue's position-API lag (~5-15s after a successful exit) so the next cycle's fill-circuit-breaker doesn't
+ * re-fire on stale "still holding" positions.
  */
 const RECENT_EXIT_SUPPRESS_MS = 30_000;
 
@@ -143,9 +149,11 @@ export class CashFillExitService {
       }
 
       try {
+        // Mark BEFORE awaiting — see RECENT_EXIT_SUPPRESS_MS doc above. Marking inside try means an unlikely
+        // throw from markExitSubmitted itself falls into the same catch path as a submit failure.
+        this.markExitSubmitted(input.venue, position.tokenId);
         const result = await this.adapter.createMarketableOrder(plan.intent, input.signer);
         submitted += 1;
-        this.markExitSubmitted(input.venue, position.tokenId);
         this.store.recordOrderResult(result);
         this.store.recordEvent({
           venue: input.venue,
