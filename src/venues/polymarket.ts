@@ -527,7 +527,7 @@ export class PolymarketVenue implements VenueAdapter {
       .filter((fill) => fill.ts >= sinceTs);
     const positionValueUsd = positions.reduce((sum, position) => sum + finiteOrZero(position.notionalUsd), 0);
     const valueUsd = finiteOrUndefined(toFiniteNumber(valuePayload?.value, valuePayload?.totalValue, valuePayload?.currentValue));
-    const equityUsd = valueUsd ?? accountEquityUsd(balances, positionValueUsd);
+    const equityUsd = pickPolymarketEquityUsd(valueUsd, balances, positionValueUsd);
     const realizedPnlUsd = sumDefined([
       finiteOrUndefined(toFiniteNumber(valuePayload?.realizedPnl, valuePayload?.realizedPnlUsd)),
       ...fills.map((fill) => fill.realizedPnlUsd)
@@ -1346,4 +1346,16 @@ function sumDefined(values: Array<number | undefined>): number | undefined {
   const finite = values.filter((value): value is number => Number.isFinite(value));
   if (finite.length === 0) return undefined;
   return Number(finite.reduce((sum, value) => sum + value, 0).toFixed(4));
+}
+
+/** ?? would treat the platform's literal 0 as truthy and skip the balance fallback; require strict > 0 to use it. */
+export function pickPolymarketEquityUsd(
+  valueUsd: number | undefined,
+  balances: Balance[],
+  positionValueUsd: number
+): number | undefined {
+  if (valueUsd !== undefined && Number.isFinite(valueUsd) && valueUsd > 0) {
+    return valueUsd;
+  }
+  return accountEquityUsd(balances, positionValueUsd);
 }
