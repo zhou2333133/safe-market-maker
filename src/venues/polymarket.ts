@@ -376,6 +376,12 @@ export class PolymarketVenue implements VenueAdapter {
     this.wsClient().setUserEventListener(listener);
   }
 
+  /** Pass-through to the market-channel WS book-update hook. Engine wires this so it can re-run placement
+   *  protections in real-time the moment the orderbook moves, instead of waiting for the next ~16s cycle. */
+  setBookUpdateListener(listener: import('./polymarket-ws.js').PolymarketBookUpdateListener | undefined): void {
+    this.wsClient().setBookUpdateListener(listener);
+  }
+
   /** True if the user channel disconnected since the engine last consumed the flag. The engine reads this each
    *  cycle and, when true, forces a REST account-state reconcile as a belt-and-suspenders catch-up for fills that
    *  may have arrived while the WS was down. */

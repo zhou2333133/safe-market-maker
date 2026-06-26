@@ -50,6 +50,18 @@ export interface PolymarketUserChannelState {
  * timestamp we received it locally. The handler is expected to be cheap and never throw — exceptions get caught
  * and recorded by the WS client so a buggy listener can't kill the socket. Returning anything is ignored.
  */
+/**
+ * Callback shape for live market-channel orderbook updates. Invoked after every WS `book` snapshot or
+ * `price_change` delta that the venue pushes for a subscribed token. The handler is expected to be cheap and
+ * never throw — exceptions are caught and swallowed by the WS client so a buggy listener can't kill the socket.
+ * Use this to react to depth changes in real-time (e.g. retreat a resting BUY when front cushion erodes) instead
+ * of waiting for the next cycle.
+ */
+export type PolymarketBookUpdateListener = (
+  tokenId: string,
+  kind: 'snapshot' | 'price_change'
+) => void;
+
 export type PolymarketUserEventListener = (
   type: 'order' | 'trade',
   record: Record<string, unknown>,
@@ -83,6 +95,10 @@ export class PolymarketWsClient {
    *  ledger fills the moment the venue confirms them — independent of the REST data-api (which is the path that
    *  intermittently stalls through the user's proxy). */
   private userEventListener?: PolymarketUserEventListener;
+  /** Optional listener that fires after every market-channel book update (snapshot or delta). The engine uses
+   *  this to re-evaluate placement protections in real-time instead of waiting for the next cycle. Wrapped in
+   *  try/catch at the invocation site so a buggy listener can't tear down the WS reader. */
+  private bookUpdateListener?: PolymarketBookUpdateListener;
   /** Timestamp of the most recent user-channel disconnect; bot uses this to know it should force a REST reconcile
    *  on the next cycle (because the WS may have missed fills during the gap). 0 means "no disconnect since last
    *  successful subscribe", i.e. WS-stream-only is authoritative. */
@@ -227,6 +243,13 @@ export class PolymarketWsClient {
    *  same listener twice is a no-op; passing undefined clears the listener. The listener fires for every event
    *  including events received between subscribe and the listener being registered (we replay the buffered ones
    *  so a startup race doesn't lose fills). */
+  /** Register the market-channel book-update listener. Replaces any previously set listener; pass undefined to
+   *  clear. Invoked synchronously inside onMessage AFTER the book cache has been updated, so the listener can
+   *  read the fresh book via getCachedOrderbook(tokenId) immediately. */
+  setBookUpdateListener(listener: PolymarketBookUpdateListener | undefined): void {
+    this.bookUpdateListener = listener;
+  }
+
   setUserEventListener(listener: PolymarketUserEventListener | undefined): void {
     const previous = this.userEventListener;
     this.userEventListener = listener;
@@ -455,6 +478,13 @@ export class PolymarketWsClient {
         continue;
       }
       this.resolveWaiters(assetId);
+      // Notify the registered listener (engine) so it can re-run placement protections on the fresh book
+      // immediately. Wrapped in try/catch so a buggy listener can never tear down the WS reader loop —
+      // losing one notification is preferable to losing the socket and going dark on subsequent updates.
+      if (this.bookUpdateListener) {
+        try { this.bookUpdateListener(assetId, type === 'book' ? 'snapshot' : 'price_change'); }
+        catch { /* swallow */ }
+      }
     }
   }
 

@@ -95,6 +95,14 @@ export interface VenueAdapter {
    *  consumed this flag, and 0 otherwise. The engine reads it once per cycle to decide whether to force a REST
    *  account-state reconcile (catching fills that may have happened during the gap). */
   consumeUserChannelDisconnectFlag?(): number;
+  /** OPTIONAL: register a listener that fires after every market-channel orderbook update (snapshot or delta).
+   *  The engine uses this to re-evaluate the 3 placement protections (front depth / reward band / exit liquidity)
+   *  IMMEDIATELY when a book moves — instead of waiting for the next ~16s cycle. Predict's WS only pushes on
+   *  trades so it leaves this undefined; the engine's per-cycle path remains its sole protection signal. */
+  setBookUpdateListener?(listener: (
+    tokenId: string,
+    kind: 'snapshot' | 'price_change'
+  ) => void | undefined): void;
   getBalances(address: string, signer?: SignerProvider): Promise<Balance[]>;
   getPositions(address: string): Promise<Position[]>;
   getOpenOrders(address: string): Promise<OpenOrder[]>;

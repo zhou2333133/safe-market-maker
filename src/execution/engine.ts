@@ -13,7 +13,7 @@ import { OrderReconciler } from './order-reconciler.js';
 import { fullCashAuditBasketFromValue, RouteService } from './route-service.js';
 import { LiquidationService } from './liquidation-service.js';
 import { MarketDataSyncService } from './market-data-sync.js';
-import { CancelService } from './cancel-service.js';
+import { CancelService, shouldRetreatThinFront } from './cancel-service.js';
 import { CashFillExitService, isMaterialCashPosition, type CashFillExitResult } from './cash-fill-exit-service.js';
 import { ExecutionRecorder } from './event-recorder.js';
 import { QuoteCycleService } from './quote-cycle-service.js';
@@ -120,6 +120,15 @@ export class ExecutionEngine {
         (tokenId, fillSize, fillPrice) => { void this.protectOnFill('polymarket', tokenId, fillSize, fillPrice); }
       );
       this.adapter.setUserEventListener(handler.handle.bind(handler));
+    }
+    // === A-3: market-channel WS book-update hook. Whenever POLY pushes a book snapshot or price_change delta,
+    // re-run the 3 placement protections on the just-updated book and cancel any resting order that no longer
+    // qualifies — without waiting for the next ~16s cycle. Predict's WS does not push book deltas, so it leaves
+    // this method undefined and the engine skips the wiring. POLY-only side-effect.
+    if (typeof this.adapter.setBookUpdateListener === 'function') {
+      this.adapter.setBookUpdateListener((tokenId) => {
+        void this.protectOnBookUpdate('polymarket', tokenId);
+      });
     }
   }
 
@@ -906,6 +915,98 @@ export class ExecutionEngine {
       });
     } finally {
       release();
+      perVenue.delete(tokenId);
+    }
+  }
+
+  /**
+   * A-3: WS-driven placement-protection re-check. Called by the market-channel WS hook the moment a book
+   * snapshot or delta arrives for a watched token. Re-runs shouldRetreatThinFront on the fresh book and
+   * cancels resting orders whose 3 conditions (front depth / rear exit liquidity) no longer hold — without
+   * waiting for the next ~16s cycle, which is the core gap between "理论上不被吃" and "现实里偶尔被吃".
+   *
+   * Cheap by construction: shouldRetreatThinFront is a pure O(book) check (<50us typical). Only fires a
+   * cancel when retreat is actually warranted; healthy book updates are silent no-ops. Per-(venue, tokenId)
+   * dedupe (shared with protectOnFill via protectingTokens) collapses a burst of WS deltas into one task.
+   */
+  async protectOnBookUpdate(venue: VenueName, tokenId: string): Promise<void> {
+    let perVenue = this.protectingTokens.get(venue);
+    if (!perVenue) {
+      perVenue = new Set<string>();
+      this.protectingTokens.set(venue, perVenue);
+    }
+    if (perVenue.has(tokenId)) return;
+    perVenue.add(tokenId);
+
+    try {
+      // Find this token's managed BUY orders (the only kind shouldRetreatThinFront acts on). If none, the
+      // book update is irrelevant to us — return silently. This is the hot path: 99% of book updates land
+      // on tokens we either don't quote or have no resting order on.
+      const managed = this.store.listManagedOpenOrders(venue)
+        .filter((order) => order.tokenId === tokenId && order.status === 'OPEN' && order.side === 'BUY');
+      if (managed.length === 0) return;
+
+      // Read the just-updated book straight from the WS push cache (zero-cost). If the adapter doesn't
+      // expose getCachedOrderbook OR the cache miss-fired (e.g. just primed but not pushed), skip — the
+      // cycle's REST verify path will catch it.
+      const book = this.adapter.getCachedOrderbook?.(tokenId);
+      if (!book) return;
+
+      // Need the Market metadata for the retreat check (carries tickSize, reward shape). Take it from the
+      // resolved-markets cache; if missing, skip — cycle will catch up. Don't await a fetch here: this hot
+      // path must stay sub-millisecond.
+      const markets = await this.marketDataSync.resolveMarketsForOpenOrders(venue, [tokenId]);
+      const market = markets.find((m) => m.tokenId === tokenId);
+      if (!market) return;
+
+      // Per-order retreat check. shouldRetreatThinFront returns null when conditions still hold; we only
+      // act on the orders where they don't. This is the same pure function the cycle calls — same code,
+      // same parameters, same answer.
+      const toCancel: string[] = [];
+      const reasons: Array<{ orderId: string; reason: string }> = [];
+      for (const order of managed) {
+        const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
+        if (!retreat) continue;
+        toCancel.push(order.externalId);
+        const parts: string[] = [];
+        if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
+          parts.push(`前方深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
+        }
+        if (retreat.supportShortfall) {
+          const s = retreat.supportShortfall;
+          parts.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)} (${s.windowCents}¢ 窗口内) < 需要 $${s.requiredUsd}`);
+        }
+        reasons.push({ orderId: order.externalId, reason: parts.join(' + ') });
+      }
+      if (toCancel.length === 0) return;
+
+      // Acquire the per-venue lock (shared with protectOnFill and the cycle's quote-place phase) so we
+      // can't race a cycle that's about to place new orders, and stamp lastWsProtectAt under the lock so
+      // the cycle observes WS-protection fired this window and skips its own placement.
+      const release = await this.acquireProtectLock(venue);
+      try {
+        this.lastWsProtectAt.set(venue, Date.now());
+        await this.adapter.cancelOrders(toCancel);
+        this.store.markOrdersCanceled(venue, toCancel);
+        this.store.recordEvent({
+          venue,
+          severity: 'warn',
+          type: 'quote.protect-ws-book-retreat',
+          message: `WS 推送盘口变化即时撤单 ${toCancel.length} 单 (token ${tokenId.slice(0, 12)}…)`,
+          details: { ids: toCancel, reasons, tokenId }
+        });
+      } finally {
+        release();
+      }
+    } catch (error) {
+      this.store.recordEvent({
+        venue,
+        severity: 'error',
+        type: 'quote.protect-ws-book-retreat-failed',
+        message: error instanceof Error ? error.message : String(error),
+        details: { tokenId }
+      });
+    } finally {
       perVenue.delete(tokenId);
     }
   }
