@@ -87,8 +87,13 @@ export class ExecutionEngine {
   // Promise-chain mutex per venue. Cycle's quote-place phase AND the WS protectOnFill task acquire it, so a
   // fill detected mid-cycle gets exclusive cancel+exit access before the cycle can place new orders.
   private readonly protectLocks = new Map<VenueName, Promise<unknown>>();
-  // Per-(venue, tokenId) dedupe — multiple partial fills on the same token collapse to ONE task.
-  private readonly protectingTokens = new Map<VenueName, Set<string>>();
+  // Per-(venue, tokenId) dedupe for A-2 (WS fill → cancel+exit). SEPARATE from the book-update dedupe so a
+  // fill event always runs the stop-loss path, even when an A-3 book-retreat task happens to be in flight
+  // for the same token. Production 2026-06-26 incident: a single shared Set let A-3 silently swallow A-2,
+  // bot never tried to exit a fill and lost $76 before risk-stop kicked in.
+  private readonly protectingFillTokens = new Map<VenueName, Set<string>>();
+  // Per-(venue, tokenId) dedupe for A-3 (WS book update → retreat). Independent of fill dedupe.
+  private readonly protectingBookTokens = new Map<VenueName, Set<string>>();
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
   // > cycleStartedAt, WS already cleared a position this cycle → skip placement to avoid re-pinning the token.
   private readonly lastWsProtectAt = new Map<VenueName, number>();
@@ -117,7 +122,11 @@ export class ExecutionEngine {
         this.store,
         // Fire-and-forget WS-triggered protect hook. protectOnFill swallows its own errors and respects the
         // per-token dedupe + venue lock so the WS reader is never blocked or crashed by it.
-        (tokenId, fillSize, fillPrice) => { void this.protectOnFill('polymarket', tokenId, fillSize, fillPrice); }
+        (tokenId, fillSize, fillPrice) => { void this.protectOnFill('polymarket', tokenId, fillSize, fillPrice); },
+        // Bot's trading address for multi-maker fill-size correction. POLY's funderAddress is the proxy that
+        // shows up as `maker_address` inside record.maker_orders; without it the parser falls back to the
+        // trade-total size and inflates bot's apparent fill 10x+ on multi-maker sweeps (2026-06-26 bug).
+        () => this.config.venues?.polymarket?.funderAddress || this.lastSignerAddress
       );
       this.adapter.setUserEventListener(handler.handle.bind(handler));
     }
@@ -836,10 +845,12 @@ export class ExecutionEngine {
    */
   async protectOnFill(venue: VenueName, tokenId: string, fillSize: number, fillPrice: number): Promise<void> {
     // Per-(venue, tokenId) dedupe — multiple partial fills on the same token collapse to ONE protect task.
-    let perVenue = this.protectingTokens.get(venue);
+    // Uses the FILL-specific Set, separate from A-3's book-update dedupe so we never silently skip a stop-loss
+    // because A-3 happens to be processing the same token (this collision caused the 2026-06-26 $76 incident).
+    let perVenue = this.protectingFillTokens.get(venue);
     if (!perVenue) {
       perVenue = new Set<string>();
-      this.protectingTokens.set(venue, perVenue);
+      this.protectingFillTokens.set(venue, perVenue);
     }
     if (perVenue.has(tokenId)) return;
     perVenue.add(tokenId);
@@ -927,13 +938,14 @@ export class ExecutionEngine {
    *
    * Cheap by construction: shouldRetreatThinFront is a pure O(book) check (<50us typical). Only fires a
    * cancel when retreat is actually warranted; healthy book updates are silent no-ops. Per-(venue, tokenId)
-   * dedupe (shared with protectOnFill via protectingTokens) collapses a burst of WS deltas into one task.
+   * dedupe (own protectingBookTokens Set — NEVER shares with A-2's fill dedupe; book and fill events must
+   * be able to run concurrently on the same token so a book retreat never silently swallows a stop-loss).
    */
   async protectOnBookUpdate(venue: VenueName, tokenId: string): Promise<void> {
-    let perVenue = this.protectingTokens.get(venue);
+    let perVenue = this.protectingBookTokens.get(venue);
     if (!perVenue) {
       perVenue = new Set<string>();
-      this.protectingTokens.set(venue, perVenue);
+      this.protectingBookTokens.set(venue, perVenue);
     }
     if (perVenue.has(tokenId)) return;
     perVenue.add(tokenId);

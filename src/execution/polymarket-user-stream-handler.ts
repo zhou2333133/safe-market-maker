@@ -26,12 +26,23 @@ import type { VenueName } from '../domain/types.js';
  */
 export type PolymarketFillProtectHook = (tokenId: string, fillSize: number, fillPrice: number) => void;
 
+/**
+ * Returns the bot's current Polymarket maker wallet address (lower-case or mixed-case). When provided,
+ * parsePolymarketTrade can find bot's slice of a multi-maker fill (record.maker_orders[i].matched_amount)
+ * instead of recording the entire trade size. Production 2026-06-26: a multi-maker SELL was logged as
+ * size=2065 (trade total) when bot's actual portion was ~150 — the inflated size caused the exit submit
+ * to be rejected with "balance: X, order amount: Y", and the apparent loss was over-stated.
+ * Pass undefined to keep the legacy "use record.size unchanged" behaviour (suitable for unit tests).
+ */
+export type PolymarketBotAddressGetter = () => string | undefined;
+
 export class PolymarketUserStreamHandler {
   private static readonly VENUE: VenueName = 'polymarket';
 
   constructor(
     private readonly store: StateStore,
-    private readonly onFillProtect?: PolymarketFillProtectHook
+    private readonly onFillProtect?: PolymarketFillProtectHook,
+    private readonly botAddressGetter?: PolymarketBotAddressGetter
   ) {}
 
   /** Entry point passed to `polymarketVenue.setUserEventListener()`. Must not throw. */
@@ -44,7 +55,8 @@ export class PolymarketUserStreamHandler {
   }
 
   private handleTrade(record: Record<string, unknown>, receivedAt: number): void {
-    const fill = parsePolymarketTrade(record, receivedAt);
+    const botAddress = this.botAddressGetter?.();
+    const fill = parsePolymarketTrade(record, receivedAt, botAddress);
     if (!fill) {
       this.recordUnparseable('trade', record);
       return;
@@ -161,14 +173,40 @@ export interface ParsedPolymarketFill {
   fillTs: number;
 }
 
-export function parsePolymarketTrade(record: Record<string, unknown>, receivedAt: number): ParsedPolymarketFill | undefined {
+export function parsePolymarketTrade(record: Record<string, unknown>, receivedAt: number, botAddress?: string): ParsedPolymarketFill | undefined {
   // Polymarket wire schema for a TRADE message (CLOB v2): primary identifiers, side, price, size, fee. We accept
   // both snake_case and camelCase because their wire feed mixes them in places. The trade_id / id field is the
   // primary key for account_fills, so we require it; everything else is best-effort enrichment.
   const fillId = stringOrUndefined(record.trade_id ?? record.tradeId ?? record.id);
   if (!fillId) return undefined;
   const price = numberOrUndefined(record.price ?? record.match_price ?? record.matchPrice);
-  const size = numberOrUndefined(record.size ?? record.match_size ?? record.matchSize ?? record.size_matched ?? record.sizeMatched);
+  const tradeTotalSize = numberOrUndefined(record.size ?? record.match_size ?? record.matchSize ?? record.size_matched ?? record.sizeMatched);
+  // Multi-maker fill correction. When bot is one of N makers in a single trade, `record.size` is the trade
+  // TOTAL across all makers, not bot's portion. Using the inflated total as bot's fill size both miscounts
+  // the position AND causes the exit submit to fail with "balance: bot_actual_X, order amount: trade_total_Y".
+  // Strategy: when botAddress is known AND record.maker_orders is present, sum the matched_amount of entries
+  // whose maker_address matches bot. Three fall-through cases preserve the existing behaviour:
+  //   - botAddress undefined (no bot identity available) → use record.size unchanged
+  //   - record.maker_orders absent (taker-side perspective or single-maker wire shape) → use record.size
+  //   - bot not in maker_orders (bot was the taker) → use record.size, which IS the taker's full size
+  let size = tradeTotalSize;
+  if (botAddress && Array.isArray(record.maker_orders)) {
+    const lower = botAddress.toLowerCase();
+    let botMatched = 0;
+    let foundBotMaker = false;
+    for (const entry of record.maker_orders) {
+      if (!entry || typeof entry !== 'object') continue;
+      const row = entry as Record<string, unknown>;
+      const addr = stringOrUndefined(row.maker_address ?? row.makerAddress);
+      if (!addr || addr.toLowerCase() !== lower) continue;
+      const matched = numberOrUndefined(row.matched_amount ?? row.matchedAmount);
+      if (matched !== undefined && matched > 0) {
+        botMatched += matched;
+        foundBotMaker = true;
+      }
+    }
+    if (foundBotMaker && botMatched > 0) size = Number(botMatched.toFixed(8));
+  }
   if (price === undefined || size === undefined || price <= 0 || size <= 0) return undefined;
   const rawSide = stringOrUndefined(record.side)?.toUpperCase();
   const side: 'BUY' | 'SELL' | undefined = rawSide === 'BUY' || rawSide === 'SELL' ? rawSide as 'BUY' | 'SELL' : undefined;

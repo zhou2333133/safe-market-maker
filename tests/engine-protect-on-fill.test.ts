@@ -159,4 +159,25 @@ describe('ExecutionEngine.protectOnFill', () => {
     await engine.protectOnFill('polymarket', 'tokA', 100, 0.32);
     expect(adapter.getOpenOrders).toHaveBeenCalledTimes(2);
   });
+
+  it('A-2 fires even when A-3 holds the SAME token in its book-dedupe (production 2026-06-26 bug regression)', async () => {
+    // Before this fix, protectOnFill and protectOnBookUpdate shared one `protectingTokens` Set. Whichever
+    // entered first locked the other out — for the same token. Production 12:55 UTC: a book-update on
+    // token X arrived ~10ms before the fill on token X; A-3 added X to the set and was still resolving
+    // markets when the WS fill landed; A-2 looked up the (shared) Set, saw X present, returned silently.
+    // No stop-loss attempt was made and the bot held a losing position until daily-loss-limit tripped.
+    // With separate Sets (protectingFillTokens vs protectingBookTokens), A-2 runs regardless.
+    const { engine, adapter } = makeEngine();
+    setSigner(engine, '0xABC');
+    // Simulate A-3 having added the token to its OWN dedupe set (mid-flight).
+    const bookSet = new Set<string>(['tokA']);
+    (engine as unknown as { protectingBookTokens: Map<string, Set<string>> }).protectingBookTokens.set('polymarket', bookSet);
+
+    // A-2 must still fire — verify it calls getOpenOrders and stamps lastWsProtectAt.
+    await engine.protectOnFill('polymarket', 'tokA', 100, 0.32);
+    expect(adapter.getOpenOrders).toHaveBeenCalledTimes(1);
+    expect((engine as unknown as { lastWsProtectAt: Map<string, number> }).lastWsProtectAt.get('polymarket')).toBeGreaterThan(0);
+    // And A-3's set is untouched (independent state).
+    expect(bookSet.has('tokA')).toBe(true);
+  });
 });

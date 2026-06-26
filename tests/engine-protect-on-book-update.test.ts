@@ -132,7 +132,7 @@ describe('ExecutionEngine.protectOnBookUpdate (A-3: WS-driven 3-condition retrea
     await engine.protectOnBookUpdate('polymarket', 'tokA');
 
     expect(adapter.cancelOrders).not.toHaveBeenCalled();
-    expect((engine as unknown as { protectingTokens: Map<string, Set<string>> }).protectingTokens.get('polymarket')?.has('tokA')).toBe(false);
+    expect((engine as unknown as { protectingBookTokens: Map<string, Set<string>> }).protectingBookTokens.get('polymarket')?.has('tokA')).toBe(false);
     expect((engine as unknown as { lastWsProtectAt: Map<string, number> }).lastWsProtectAt.get('polymarket')).toBeUndefined();
   });
 
@@ -257,6 +257,6 @@ describe('ExecutionEngine.protectOnBookUpdate (A-3: WS-driven 3-condition retrea
     insertManagedOrder(store, { tokenId: 'tokA', externalId: 'ext1', side: 'BUY', price: 0.40, size: 75 });
 
     await expect(engine.protectOnBookUpdate('polymarket', 'tokA')).resolves.toBeUndefined();
-    expect((engine as unknown as { protectingTokens: Map<string, Set<string>> }).protectingTokens.get('polymarket')?.has('tokA')).toBe(false);
+    expect((engine as unknown as { protectingBookTokens: Map<string, Set<string>> }).protectingBookTokens.get('polymarket')?.has('tokA')).toBe(false);
   });
 });
