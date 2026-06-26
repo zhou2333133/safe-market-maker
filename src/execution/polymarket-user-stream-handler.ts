@@ -18,10 +18,21 @@ import type { VenueName } from '../domain/types.js';
  *   - Drive any business decision (positions, exits) — those still depend on the REST account snapshot. This
  *     service only ensures the fill is in the ledger so the FOLLOWING REST snapshot won't be the FIRST trace.
  */
+/**
+ * Optional "protect on fill" hook the engine passes in to react to WS-confirmed fills BEFORE the next cycle's REST
+ * positions sync notices them. Invoked once per parsed trade event with the fill's token/size/price. Must not throw —
+ * fire-and-forget; the engine is expected to spawn the async protect task and handle its own errors. Without this
+ * hook the handler stays at its original ledger-only behaviour (no behavior change for tests that don't wire it).
+ */
+export type PolymarketFillProtectHook = (tokenId: string, fillSize: number, fillPrice: number) => void;
+
 export class PolymarketUserStreamHandler {
   private static readonly VENUE: VenueName = 'polymarket';
 
-  constructor(private readonly store: StateStore) {}
+  constructor(
+    private readonly store: StateStore,
+    private readonly onFillProtect?: PolymarketFillProtectHook
+  ) {}
 
   /** Entry point passed to `polymarketVenue.setUserEventListener()`. Must not throw. */
   handle(type: 'order' | 'trade', record: Record<string, unknown>, receivedAt: number): void {
@@ -85,6 +96,13 @@ export class PolymarketUserStreamHandler {
           sourceWireType: String(record.event_type ?? record.type ?? 'trade')
         }
       });
+      // After successful ledger, invoke the protect hook so the engine can spawn the cancel+exit task
+      // BEFORE the next cycle's REST positions sync would have noticed the fill. The hook is fire-and-forget;
+      // any error inside it must NOT propagate back to the WS reader (would kill the socket).
+      if (this.onFillProtect && fill.tokenId && Number.isFinite(fill.price) && Number.isFinite(fill.size) && fill.size > 0) {
+        try { this.onFillProtect(fill.tokenId, fill.size, fill.price); }
+        catch { /* hook errors are the engine's problem, not ours */ }
+      }
     } catch (error) {
       // Database write failing must not kill the WS reader. Record and move on — REST snapshot is still the
       // belt-and-suspenders backup.

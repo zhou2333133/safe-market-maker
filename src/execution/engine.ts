@@ -79,6 +79,19 @@ export class ExecutionEngine {
   private readonly recorder: ExecutionRecorder;
   private readonly quoteCycleService: QuoteCycleService;
   private readonly splitEntryService: SplitEntryService;
+  // === A-2: WS-triggered protect-on-fill coordinator state ===
+  // Signer captured from each runOnce so the out-of-cycle WS hook has credentials to act. Until a cycle has
+  // run, protectOnFill silently no-ops (WS fills cannot arrive before the venue is subscribed anyway).
+  private lastSigner: SignerProvider | undefined;
+  private lastSignerAddress: string | undefined;
+  // Promise-chain mutex per venue. Cycle's quote-place phase AND the WS protectOnFill task acquire it, so a
+  // fill detected mid-cycle gets exclusive cancel+exit access before the cycle can place new orders.
+  private readonly protectLocks = new Map<VenueName, Promise<unknown>>();
+  // Per-(venue, tokenId) dedupe — multiple partial fills on the same token collapse to ONE task.
+  private readonly protectingTokens = new Map<VenueName, Set<string>>();
+  // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
+  // > cycleStartedAt, WS already cleared a position this cycle → skip placement to avoid re-pinning the token.
+  private readonly lastWsProtectAt = new Map<VenueName, number>();
 
   constructor(
     private readonly config: AppConfig,
@@ -100,12 +113,22 @@ export class ExecutionEngine {
     // Predict has no such channel today, so its adapter leaves the method undefined and the engine just doesn't
     // register anything. POLY-only side-effect.
     if (typeof this.adapter.setUserEventListener === 'function') {
-      const handler = new PolymarketUserStreamHandler(this.store);
+      const handler = new PolymarketUserStreamHandler(
+        this.store,
+        // Fire-and-forget WS-triggered protect hook. protectOnFill swallows its own errors and respects the
+        // per-token dedupe + venue lock so the WS reader is never blocked or crashed by it.
+        (tokenId, fillSize, fillPrice) => { void this.protectOnFill('polymarket', tokenId, fillSize, fillPrice); }
+      );
       this.adapter.setUserEventListener(handler.handle.bind(handler));
     }
   }
 
   async runOnce(options: RunOnceOptions): Promise<RunOnceResult> {
+    const cycleStartedAt = Date.now();
+    // Capture signer for the out-of-cycle WS-triggered protectOnFill hook (A-2). Updated every cycle so the
+    // hook always uses the freshest credentials.
+    this.lastSigner = options.signer;
+    this.lastSignerAddress = options.signer.address;
     const signerAddress = options.signer.address;
     const dayStart = accountRiskWindowStart(options.venue, this.store);
     // WS user-channel reconcile: if the user channel disconnected since last cycle, record an event so the
@@ -488,24 +511,49 @@ export class ExecutionEngine {
         canceledManagedOrders: replaceCancel.canceledIds.length
       };
     }
-    const quoteCycle = await this.quoteCycleService.process({
-      venue: options.venue,
-      signer: options.signer,
-      signerAddress,
-      dayStart,
-      intents: replaceRace.placeable,
-      books,
-      balances,
-      positions,
-      openOrders,
-      accountRiskDecision: accountRisk
-    });
-    this.stage(options.venue, 'idle', '本轮实盘循环完成', {
-      accepted: quoteCycle.accepted,
-      rejected: quoteCycle.rejected,
-      balanceSkipped: quoteCycle.balanceSkipped
-    });
-    return {};
+    // Acquire the per-venue protect lock and bail if a WS-triggered protect task already cleared a position
+    // during this cycle. Without this we'd place fresh orders on the very token we just exited — re-entering
+    // the position we paid ~1¢ slippage to leave. The lock also serializes with any concurrent WS task so a
+    // late-arriving WS fill cannot race the place we're about to do.
+    const placeLockRelease = await this.acquireProtectLock(options.venue);
+    try {
+      const wsProtectAt = this.lastWsProtectAt.get(options.venue) ?? 0;
+      if (wsProtectAt > cycleStartedAt) {
+        this.store.recordEvent({
+          venue: options.venue,
+          severity: 'warn',
+          type: 'quote.ws-protect-deferred',
+          message: 'WS 推送成交保护本轮已先行执行，跳过新挂单以避免覆盖刚清的仓位',
+          details: { wsProtectAt, cycleStartedAt }
+        });
+        this.recorder.runCheckpoint(options.venue, {
+          skippedQuoting: true,
+          wsProtectedThisCycle: true
+        });
+        this.stage(options.venue, 'idle', 'WS 推送成交保护本轮已执行，跳过新挂单', { wsProtectAt });
+        return { skippedQuoting: true };
+      }
+      const quoteCycle = await this.quoteCycleService.process({
+        venue: options.venue,
+        signer: options.signer,
+        signerAddress,
+        dayStart,
+        intents: replaceRace.placeable,
+        books,
+        balances,
+        positions,
+        openOrders,
+        accountRiskDecision: accountRisk
+      });
+      this.stage(options.venue, 'idle', '本轮实盘循环完成', {
+        accepted: quoteCycle.accepted,
+        rejected: quoteCycle.rejected,
+        balanceSkipped: quoteCycle.balanceSkipped
+      });
+      return {};
+    } finally {
+      placeLockRelease();
+    }
   }
 
   async assertAccountRiskAllowsOrder(venue: VenueName, signerAddress: string, signer: SignerProvider): Promise<AccountRiskDecision> {
@@ -749,6 +797,117 @@ export class ExecutionEngine {
         ? `当前 BNB 足够覆盖 route switch 的 merge+split 估算 ${required.toFixed(8)} BNB`
         : `当前 BNB 不足以覆盖 route switch 的 merge+split；当前约 ${(Number.isFinite(balance) ? balance : 0).toFixed(8)} BNB，预计至少 ${required.toFixed(8)} BNB`
     };
+  }
+
+  // === A-2: WS-triggered protect-on-fill ===
+
+  /**
+   * Promise-chain mutex for the per-venue protect path. Both the cycle's quote-place phase and the WS-triggered
+   * protectOnFill task acquire this so they cannot race. Returns a release fn the caller MUST invoke in finally
+   * — leaking it would block all subsequent acquirers forever.
+   */
+  private async acquireProtectLock(venue: VenueName): Promise<() => void> {
+    const previous = this.protectLocks.get(venue) ?? Promise.resolve();
+    let release: () => void = () => { /* placeholder, replaced by Promise executor */ };
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.protectLocks.set(venue, previous.then(() => current));
+    await previous;
+    return release;
+  }
+
+  /**
+   * WS-triggered "protect on fill" entry point. Invoked by the Polymarket user-channel WS handler the moment a
+   * trade event arrives, BYPASSING the REST positions sync (which observably lags 10-30s in production) to cut
+   * the cancel+exit reaction time from one full cycle (~20s) down to ~3-5s. Per-token dedupe + per-venue lock
+   * prevent multiple in-flight fills from racing each other or the cycle's place phase.
+   *
+   * Errors are swallowed into store events — fire-and-forget from the WS reader's perspective; an unhandled
+   * rejection would crash the Node process. Until a cycle has captured a signer (lastSigner unset), the call
+   * silently no-ops because no WS fills can arrive before the venue has authenticated anyway.
+   */
+  async protectOnFill(venue: VenueName, tokenId: string, fillSize: number, fillPrice: number): Promise<void> {
+    // Per-(venue, tokenId) dedupe — multiple partial fills on the same token collapse to ONE protect task.
+    let perVenue = this.protectingTokens.get(venue);
+    if (!perVenue) {
+      perVenue = new Set<string>();
+      this.protectingTokens.set(venue, perVenue);
+    }
+    if (perVenue.has(tokenId)) return;
+    perVenue.add(tokenId);
+
+    const signer = this.lastSigner;
+    const signerAddress = this.lastSignerAddress;
+    if (!signer || !signerAddress) {
+      // Engine not warmed up; cycle will pick up this fill on its next pass via REST sync.
+      perVenue.delete(tokenId);
+      return;
+    }
+
+    const release = await this.acquireProtectLock(venue);
+    try {
+      // Stamp the coordinator BEFORE doing work so the cycle (checking inside the same lock right before its
+      // quote-place call) reliably observes that WS-protection fired during its window.
+      this.lastWsProtectAt.set(venue, Date.now());
+
+      // Build a synthetic Position straight from the WS trade event — do NOT call syncPositions, which is the
+      // very dependency we're bypassing. averagePrice = fillPrice (the position came into being at this price
+      // by definition); size = fillSize (sufficient to trigger the exit path; further partial fills on the same
+      // token collapse to the same dedupe key and become no-ops).
+      const syntheticPosition: Position = {
+        venue,
+        tokenId,
+        size: fillSize,
+        notionalUsd: fillSize * fillPrice,
+        averagePrice: fillPrice
+      };
+
+      // Pull a fresh open-orders snapshot so cancelManagedOrders has something to act on. Failure → empty list;
+      // cancelManagedOrders no-ops on empty input and the cycle's next pass owns the cleanup. The exit still
+      // fires either way — getting the position off the book is the higher-priority half.
+      let openOrders: OpenOrder[] = [];
+      try {
+        openOrders = await this.adapter.getOpenOrders(signerAddress);
+      } catch {
+        /* swallow — proceed with [] */
+      }
+
+      await this.cancelService.cancelManagedOrders(
+        venue,
+        openOrders,
+        'WS 推送实时成交，立即撤单后退场',
+        'fill-circuit-breaker.ws-triggered.cancel'
+      );
+
+      const markets = await this.cashExitMarkets(venue, [syntheticPosition]);
+      this.adapter.hydrateFromMarkets?.(markets);
+
+      await this.cashFillExitService.process({
+        venue,
+        signer,
+        positions: [syntheticPosition],
+        openOrders: [],
+        markets
+      });
+
+      this.store.recordEvent({
+        venue,
+        severity: 'warn',
+        type: 'fill-circuit-breaker.ws-triggered',
+        message: `WS 推送实时成交触发立即保护：撤单 + 退场 token=${tokenId.slice(0, 12)}…`,
+        details: { tokenId, fillSize, fillPrice }
+      });
+    } catch (error) {
+      this.store.recordEvent({
+        venue,
+        severity: 'error',
+        type: 'fill-circuit-breaker.ws-triggered-failed',
+        message: error instanceof Error ? error.message : String(error),
+        details: { tokenId, fillSize, fillPrice }
+      });
+    } finally {
+      release();
+      perVenue.delete(tokenId);
+    }
   }
 }
 
