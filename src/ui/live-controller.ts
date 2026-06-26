@@ -30,6 +30,14 @@ import { publicErrorMessage } from '../observability/error-message.js';
 const LIVE_LOOP_RETRY_MIN_MS = 5000;
 const LIVE_LOOP_RETRY_MAX_MS = 60000;
 const LIVE_LOOP_CYCLE_TIMEOUT_MS = 45000;
+// Hard ceiling on a single cycle. The soft timeout (LIVE_LOOP_CYCLE_TIMEOUT_MS) only fires a callback; it lets
+// the cycle keep running. If a cycle's runOnce(...) await never resolves — e.g. a Predict REST call awaiting
+// a TCP socket the server never closes — the cycle wrapper used to block forever. Observed 2026-06-26: Predict
+// cycle 572 hung 2h+ while the watchdog only logged staleness. After this hard timeout the cycle wrapper
+// throws an error that the existing catch block treats as a retryable network-class fault and the loop schedules
+// the next cycle ~5s later. The orphan promise is left to settle in the background (typically resolves when the
+// OS-level socket timeout fires ~2 min later); accepting that small leak is preferable to a deadlocked loop.
+const LIVE_LOOP_CYCLE_HARD_TIMEOUT_MS = 5 * 60 * 1000;
 // Reuse the venue adapter across loop ticks instead of rebuilding it (preflight + CLOB credential derivation + WS
 // connection) on every cycle. Fast quote-refresh ticks run ~10x more often than full cycles; rebuilding the adapter
 // each tick would hammer the venue's auth/TLS endpoints (createApiKey) and churn the WS book subscription. The adapter
@@ -307,6 +315,22 @@ async function runLiveLoop(
                   cycle
                 });
               }
+            },
+            {
+              hardTimeoutMs: LIVE_LOOP_CYCLE_HARD_TIMEOUT_MS,
+              onHardTimeout: () => {
+                // Surface the hang loudly so the operator can see the supervisor self-healed. The orphaned
+                // runOnce promise will resolve in the background when its underlying network call times out
+                // at the OS level (typically ~2 min); we accept that small write-race risk in exchange for
+                // recovering the loop within 5 min instead of waiting hours.
+                store.recordEvent({
+                  venue,
+                  severity: 'error',
+                  type: 'ui.live.cycle.hard-timeout',
+                  message: `${venue} 实盘循环第 ${cycle} 轮卡死超过 ${LIVE_LOOP_CYCLE_HARD_TIMEOUT_MS / 1000} 秒，放弃当前 cycle 启动下一轮（supervisor 自愈）`,
+                  details: { cycle, hardTimeoutMs: LIVE_LOOP_CYCLE_HARD_TIMEOUT_MS }
+                });
+              }
             }
           );
           if (runResult.stopRequested) {
@@ -518,20 +542,38 @@ export async function withLiveCycleTimeout<T>(
   ms: number,
   venue: VenueName,
   cycle: number,
-  onTimeout?: () => void
+  onTimeout?: () => void,
+  options?: { hardTimeoutMs?: number; onHardTimeout?: () => void }
 ): Promise<T> {
-  let timeout: NodeJS.Timeout | undefined;
+  let softTimer: NodeJS.Timeout | undefined;
+  let hardTimer: NodeJS.Timeout | undefined;
   let timedOut = false;
+  let hardTimedOut = false;
   try {
-    timeout = setTimeout(() => {
+    softTimer = setTimeout(() => {
       timedOut = true;
       onTimeout?.();
     }, ms);
+    if (options?.hardTimeoutMs && options.hardTimeoutMs > ms) {
+      // Race the promise against the hard ceiling. When the ceiling wins, throw a real error so the cycle
+      // wrapper's catch sees a retryable network-class fault and schedules the next cycle. Without this race,
+      // a runOnce that never resolves blocks the wrapper forever (observed in production 2026-06-26).
+      const hardPromise = new Promise<never>((_, reject) => {
+        hardTimer = setTimeout(() => {
+          hardTimedOut = true;
+          options.onHardTimeout?.();
+          reject(new Error(`${venue} live cycle ${cycle} hard-timeout after ${options.hardTimeoutMs}ms; abandoning stuck cycle so the next one can start`));
+        }, options.hardTimeoutMs);
+      });
+      return await Promise.race([promise, hardPromise]);
+    }
     return await promise;
   } finally {
-    if (timeout) clearTimeout(timeout);
-    if (timedOut) {
-      // The caller records the slow-cycle event; this guard keeps the cycle serialized.
+    if (softTimer) clearTimeout(softTimer);
+    if (hardTimer) clearTimeout(hardTimer);
+    if (timedOut && !hardTimedOut) {
+      // Soft-timeout serialization: wait for the still-pending promise so the next cycle doesn't overlap.
+      // Skipped on hard-timeout — that path DELIBERATELY abandons the promise so the loop can recover.
       await promise.catch(() => undefined);
     }
   }
