@@ -900,6 +900,11 @@ export class ExecutionEngine {
         'fill-circuit-breaker.ws-triggered.cancel'
       );
 
+      // Attach cached market to the synthetic position so cashExitMarkets can use it
+      // without a REST fetch. Cache miss is fine — cashExitMarkets falls back to REST.
+      const cachedMarket = this.marketDataSync.getMarketFromCache(venue, tokenId);
+      if (cachedMarket) (syntheticPosition as unknown as Record<string, unknown>).market = cachedMarket;
+
       const markets = await this.cashExitMarkets(venue, [syntheticPosition]);
       this.adapter.hydrateFromMarkets?.(markets);
 

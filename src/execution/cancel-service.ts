@@ -723,15 +723,17 @@ function readCashMaintenanceStaleState(value: unknown): Map<string, CashMaintena
 }
 
 /**
- * Predict-only: cash-protected BUY orders on Predict venues qualify for REST-based verify-before-cancel
- * (longNakedRest path). Polymarket unreserved maker BUY orders are protected by A-3 WS book retreat instead —
- * Predict has no WS book pushes for quiet/no-trade markets, so the REST verify path fills that gap.
+ * Predict + Polymarket unreserved maker: cash-protected BUY orders qualify for REST-based
+ * verify-before-cancel (longNakedRest path) and stale-book strike counter. Predict has no WS book
+ * pushes for quiet markets, so the REST verify path is critical. Polymarket has A-3 WS retreat but
+ * no fallback when books go stale — the REST verify + counter close that blind spot.
  */
 function isCashProtectedBuyOrder(config: AppConfig, order: OpenOrder, market: Market): boolean {
   return config.strategy.entryMode === 'cash'
     && !isPairedEntryMode(config)
     && order.side === 'BUY'
-    && market.venue === 'predict'
+    && (market.venue === 'predict'
+        || (market.venue === 'polymarket' && config.strategy.polymarketUnreservedMaker === true))
     && Number.isFinite(market.rewards?.minShares)
     && (market.rewards?.minShares ?? 0) > 0
     && Number.isFinite(market.rewards?.maxSpreadCents)
