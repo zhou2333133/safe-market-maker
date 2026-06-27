@@ -70,7 +70,7 @@ export async function liveStart(configPath: string, body: unknown, liveLoops: Li
   if (selectedCount === 0 && !loaded.config.strategy.autoSelectMarkets) {
     throw new UiError(400, '还没有选择实盘市场。请先在“市场”页应用推荐，或手动配置 selectedMarkets。');
   }
-  const passphrase = typeof request.passphrase === 'string' ? request.passphrase : '';
+  const passphrase = typeof request.passphrase === 'string' && request.passphrase ? request.passphrase : (process.env.SAFE_MM_PASSPHRASE ?? '');
   ensureDataDirs(loaded.dataDir);
   let signer!: SignerProvider;
   const store = usingStore(loaded.dataDir);
@@ -217,7 +217,7 @@ export function restoreLiveLoops(configPath: string, liveLoops: LiveLoops): void
       checkpointLiveSession(configPath, venue, resumedIntent.sessionStartedAt, 'auto-resume', '自动恢复沿用上次开始实盘时的本轮止损统计窗口');
       const loop = createLiveLoopState(venue, new Date(resumedIntent.sessionStartedAt), { restored: true, restartCount: 0 });
       liveLoops.set(venue, loop);
-      loop.running = runLiveLoop(configPath, venue, '', signer, loop).catch((error) => containVenueLoopFailure(configPath, venue, loop, error));
+      loop.running = runLiveLoop(configPath, venue, process.env.SAFE_MM_PASSPHRASE ?? '', signer, loop).catch((error) => containVenueLoopFailure(configPath, venue, loop, error));
       const message = intent.source === 'open-order-adoption'
         ? '服务启动时发现已有开放订单，已自动接管监控，先同步真实开放订单再决定撤换或挂单'
         : '检测到上次实盘运行意图，已自动恢复循环，先同步真实开放订单再决定撤换或挂单';
