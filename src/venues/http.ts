@@ -1,6 +1,8 @@
 import { redact } from '../observability/redact.js';
 
 const MIN_HTTP_INTERVAL_MS = 120;
+const HTTP_RETRY_MAX = 2;
+const HTTP_RETRY_BACKOFF_MS = 1000;
 const lastRequestByOrigin = new Map<string, number>();
 const queueByOrigin = new Map<string, Promise<void>>();
 
@@ -15,6 +17,23 @@ export class HttpError extends Error {
 }
 
 export async function httpJson<T>(
+  url: string,
+  options: RequestInit & { timeoutMs?: number } = {}
+): Promise<T> {
+  for (let attempt = 0; attempt <= HTTP_RETRY_MAX; attempt += 1) {
+    try {
+      return await httpJsonOnce(url, options);
+    } catch (error) {
+      const isConnectionError = error instanceof TypeError ||
+        (error instanceof Error && (error.message === 'fetch failed' || error.message.includes('aborted')));
+      if (!isConnectionError || attempt >= HTTP_RETRY_MAX) throw error;
+      await new Promise((resolve) => setTimeout(resolve, HTTP_RETRY_BACKOFF_MS));
+    }
+  }
+  throw new Error('unreachable');
+}
+
+async function httpJsonOnce<T>(
   url: string,
   options: RequestInit & { timeoutMs?: number } = {}
 ): Promise<T> {
