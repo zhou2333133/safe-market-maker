@@ -618,7 +618,10 @@ export function shouldRetreatThinFront(
   // (c) Queue-position retreat. Even if front USD depth is fine, if the number of DISTINCT price levels ahead
   // has dropped below the configured minimum, other market makers have vacated and we are now exposed at the
   // front of the queue. The order was placed behind N levels — if that count fell, retreat.
-  const minLevels = Math.max(1, config.strategy.conservativeDepthLevel ?? 3);
+  // Polymarket uses polymarketStartLevel (match placement), Predict uses conservativeDepthLevel (match placement)
+  const minLevels = venue === 'polymarket'
+    ? Math.max(1, (config.strategy.polymarketStartLevel ?? 2) - 1)
+    : Math.max(1, config.strategy.conservativeDepthLevel ?? 3);
   const pricesAhead = new Set<number>();
   for (const level of book.bids ?? []) {
     if (level.price > order.price + 1e-9) pricesAhead.add(level.price);
