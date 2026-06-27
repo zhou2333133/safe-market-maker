@@ -188,16 +188,17 @@ export class ExecutionEngine {
       signerAddress
     });
     if (!positionSync.ok) {
-      this.stage(options.venue, 'idle', '持仓同步失败，本轮结束');
-      return {};
+      // Position sync failed entirely (REST + on-chain both unavailable, and no recent cache).
+      // Instead of skipping the whole cycle and leaving orders unsupervised, run in protect-only
+      // mode with empty positions: cancel/retreat + market guards still execute, but no new orders
+      // are placed. A-2 WS fill protection runs independently so fills are still caught.
+      this.stage(options.venue, 'idle', '持仓同步失败，降级为仅维护模式：撤单保护继续，不挂新单');
     }
-    let positions = positionSync.positions;
-    // PROTECT-ONLY mode: positions came from the cached fallback because the venue's positions API was
-    // unreachable. We have enough info (recent positions + cached account-risk snapshot + fresh orderbooks
-    // via the bulk fetch we already did) to run the cancel/retreat path on existing orders so they don't
-    // sit unprotected until someone fills them — but we MUST NOT place new orders, because the cached
-    // positions don't reflect any fills/transfers that happened during the outage.
-    const protectOnly = positionSync.cached === true;
+    let positions: Position[] = positionSync.ok ? positionSync.positions : [];
+    // PROTECT-ONLY mode: positions came from a cached fallback (positionSync.cached) OR the position sync
+    // failed entirely (positionSync.ok === false). In both cases we run cancel/retreat on existing orders
+    // but MUST NOT place new ones — the position data may not reflect recent fills/transfers.
+    const protectOnly = !positionSync.ok || positionSync.cached === true;
     let accountRisk: AccountRiskDecision;
     if (options.fast || protectOnly) {
       // Fast tick OR protect-only fallback: reuse the most recent account-risk snapshot. Fast skips the

@@ -206,12 +206,36 @@ export class AccountSyncService {
     try {
       const positions = await this.adapter.getPositions(input.signerAddress);
       this.lastKnownPositions.set(input.venue, { positions, capturedAt: Date.now() });
+      // Persist to database so restarts recover position knowledge immediately
+      if (positions.length > 0) {
+        this.store.checkpoint(`positions-cache.${input.venue}`, {
+          positions: positions.map((p) => ({
+            tokenId: p.tokenId, size: p.size, notionalUsd: p.notionalUsd,
+            averagePrice: p.averagePrice, marketId: p.marketId, outcome: p.outcome
+          })),
+          capturedAt: new Date().toISOString()
+        });
+      }
       return { ok: true, positions };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const cached = this.lastKnownPositions.get(input.venue);
-      const ageMs = cached ? Date.now() - cached.capturedAt : undefined;
-      const cacheUsable = !!cached && ageMs !== undefined && ageMs <= AccountSyncService.POSITIONS_CACHE_TTL_MS;
+      // Layer 1: in-memory cache (survives within one process lifetime)
+      let cached = this.lastKnownPositions.get(input.venue);
+      let ageMs = cached ? Date.now() - cached.capturedAt : undefined;
+      let cacheUsable = !!cached && ageMs !== undefined && ageMs <= AccountSyncService.POSITIONS_CACHE_TTL_MS;
+      // Layer 2: database-persisted cache (survives restarts)
+      if (!cacheUsable) {
+        const dbCache = this.store.getCheckpoint(`positions-cache.${input.venue}`)?.value as
+          { positions?: Array<{ tokenId: string; size: number; notionalUsd: number; averagePrice?: number; marketId?: string; outcome?: string }>; capturedAt?: string } | undefined;
+        if (dbCache?.positions?.length && dbCache.capturedAt) {
+          const dbAgeMs = Date.now() - new Date(dbCache.capturedAt).getTime();
+          if (Number.isFinite(dbAgeMs) && dbAgeMs <= AccountSyncService.POSITIONS_CACHE_TTL_MS) {
+            cached = { positions: dbCache.positions as Position[], capturedAt: Date.now() - dbAgeMs };
+            ageMs = dbAgeMs;
+            cacheUsable = true;
+          }
+        }
+      }
       if (cacheUsable && cached) {
         // PROTECT-ONLY fallback: hand back the cached positions and tag them stale. The engine routes this
         // into the cancel/retreat path on existing orders but skips placing new ones, so a transient venue
