@@ -112,8 +112,8 @@ function makeEngine(adapter: VenueAdapter, configOverrides: { strategy?: any; ri
   const engine = new ExecutionEngine(config, adapter, store);
   // Inject market resolution so the test doesn't depend on a live marketDataSync cache.
   // engine's marketDataSync is private but JS lets us monkey-patch via the engine instance.
-  (engine as unknown as { marketDataSync: { resolveMarketsForOpenOrders: (v: string, ids: string[]) => Promise<Market[]> } }).marketDataSync.resolveMarketsForOpenOrders = vi.fn(async (_venue: string, tokenIds: string[]) =>
-    tokenIds.map((id) => makeMarket(id))
+  (engine as unknown as { marketDataSync: { getMarketFromCache: (v: string, id: string) => Market | undefined } }).marketDataSync.getMarketFromCache = vi.fn((_venue: string, tokenId: string) =>
+    makeMarket(tokenId)
   );
   return { engine, store };
 }

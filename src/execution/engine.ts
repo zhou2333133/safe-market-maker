@@ -3,7 +3,7 @@ import type { AccountRiskDecision, AccountRiskSnapshot, Market, NativeGasBalance
 import type { SignerProvider } from '../secrets/signer.js';
 import type { StateStore } from '../store/sqlite.js';
 import { rejectReason } from '../risk/reject-reasons.js';
-import { planReplaceRaceDefer, primaryStableBalance } from '../risk/capital-risk.js';
+import { isUnreservedMakerVenue, planReplaceRaceDefer, primaryStableBalance } from '../risk/capital-risk.js';
 import { StrategyEngine } from '../strategy/strategy-engine.js';
 import { completeSetInventoryGroups, isCashMultiMarketEntry, isPairedEntryMode } from '../strategy/paired-inventory.js';
 import type { VenueAdapter } from '../venues/types.js';
@@ -238,7 +238,7 @@ export class ExecutionEngine {
             positions: exitPositions,
             openOrders: cancel.openOrders,
             markets: killMarkets,
-            force: true
+            force: false
           });
           killExit = mergeCashExitResults(killExit, exit);
           // After each submit (even partial/failed), pause briefly so prior fills/cancels settle on-chain and free up
@@ -494,8 +494,12 @@ export class ExecutionEngine {
     // Replace-race guard: on wallets too small to hold a just-cancelled order AND its replacement at the same time,
     // defer the re-place one cycle so the cancel settles first (otherwise the venue counts old+new on the collateral
     // group and rejects "not enough balance / allowance"). Cash single-sided only; paired/split is untouched.
+    // Skip entirely for unreserved-maker venues (Predict cash BUY, Polymarket + polymarketUnreservedMaker=true) —
+    // the venue does not freeze collateral, so the 2×-balance check is unnecessary and creates cycle-long order
+    // gaps that leave resting orders unprotected (2026-06-27 fill incident).
     const availableUsd = primaryStableBalance(balances)?.available ?? 0;
-    const replaceRace = isPairedEntryMode(this.config)
+    const skipReplaceGuard = isUnreservedMakerVenue(this.config, options.venue);
+    const replaceRace = (isPairedEntryMode(this.config) || skipReplaceGuard)
       ? { placeable: intents, deferredTokenIds: [] as string[] }
       : planReplaceRaceDefer(intents, replaceCancel.canceledTokenIds ?? [], availableUsd);
     if (replaceRace.deferredTokenIds.length > 0) {
@@ -853,18 +857,16 @@ export class ExecutionEngine {
       this.protectingFillTokens.set(venue, perVenue);
     }
     if (perVenue.has(tokenId)) return;
-    perVenue.add(tokenId);
 
     const signer = this.lastSigner;
     const signerAddress = this.lastSignerAddress;
-    if (!signer || !signerAddress) {
-      // Engine not warmed up; cycle will pick up this fill on its next pass via REST sync.
-      perVenue.delete(tokenId);
-      return;
-    }
+    if (!signer || !signerAddress) return;
 
     const release = await this.acquireProtectLock(venue);
     try {
+      // Dedupe marker set inside the lock+try so the outer finally always cleans it up,
+      // even if acquireProtectLock were to throw (which it doesn't in practice — defence in depth).
+      perVenue.add(tokenId);
       // Stamp the coordinator BEFORE doing work so the cycle (checking inside the same lock right before its
       // quote-place call) reliably observes that WS-protection fired during its window.
       this.lastWsProtectAt.set(venue, Date.now());
@@ -964,11 +966,10 @@ export class ExecutionEngine {
       const book = this.adapter.getCachedOrderbook?.(tokenId);
       if (!book) return;
 
-      // Need the Market metadata for the retreat check (carries tickSize, reward shape). Take it from the
-      // resolved-markets cache; if missing, skip — cycle will catch up. Don't await a fetch here: this hot
-      // path must stay sub-millisecond.
-      const markets = await this.marketDataSync.resolveMarketsForOpenOrders(venue, [tokenId]);
-      const market = markets.find((m) => m.tokenId === tokenId);
+      // Need the Market metadata for the retreat check (carries tickSize, reward shape).
+      // Sync cache-only read — never triggers a REST fetch. Cache miss means the cycle hasn't
+      // warmed yet; skip this WS tick and let the cycle catch up.
+      const market = this.marketDataSync.getMarketFromCache(venue, tokenId);
       if (!market) return;
 
       // Per-order retreat check. shouldRetreatThinFront returns null when conditions still hold; we only
@@ -1043,9 +1044,10 @@ function cashPositionFingerprint(
         size: Number(position.size.toFixed(8)),
         notionalUsd: Number(position.notionalUsd.toFixed(6)),
         marketId: position.marketId,
-        outcome: position.outcome
+        outcome: position.outcome,
+        tokenId: position.tokenId
       }))
-      .sort((a, b) => `${a.marketId ?? ''}:${a.outcome ?? ''}`.localeCompare(`${b.marketId ?? ''}:${b.outcome ?? ''}`))
+      .sort((a, b) => `${a.marketId ?? ''}:${a.outcome ?? ''}:${a.tokenId ?? ''}`.localeCompare(`${b.marketId ?? ''}:${b.outcome ?? ''}:${b.tokenId ?? ''}`))
   );
 }
 

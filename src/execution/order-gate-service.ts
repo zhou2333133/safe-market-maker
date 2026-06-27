@@ -158,6 +158,9 @@ export class OrderGateService {
   private evaluateMaxMarkets(input: OrderGateInput):
     | { ok: true }
     | { ok: false; activeTokenIds: string[]; maxMarkets: number; reason: string } {
+    // Only Predict cash mode enforces a hard maxMarkets gate at the order level.
+    // Polymarket unreserved maker relies on scoring-based market selection in limitByMarketGroup
+    // to naturally constrain the number of active markets — no separate gate needed.
     if (!isPredictCashMode(input.venue, this.config)) return { ok: true };
     const maxMarkets = Math.max(1, this.config.risk.maxMarkets);
     const activeTokenIds = new Set<string>();

@@ -160,6 +160,19 @@ export function isUnreservedPredictCashMakerBuy(config: AppConfig, intent: Order
     && intent.liquidity !== 'taker';
 }
 
+/** Venue-level check: when the venue does not freeze collateral for resting maker buys, the replace-race
+ *  guard (planReplaceRaceDefer) is unnecessary — cancelling old orders and immediately placing new ones
+ *  won't fail with "balance not enough" because the venue doesn't count resting orders against balance.
+ *  Skipping the guard eliminates ~16s order-placement gaps that leave orders unprotected.
+ *  2026-06-27: fix for Polymarket unreserved maker mode, where the guard was triggered at $71.94 < 2×$70,
+ *  creating cycle-long gaps that allowed taker sweeps to eat through 300U front cushion undetected by A-3. */
+export function isUnreservedMakerVenue(config: AppConfig, venue: string): boolean {
+  return config.strategy.entryMode === 'cash'
+    && !isPairedEntryMode(config)
+    && (venue === 'predict'
+        || (venue === 'polymarket' && config.strategy.polymarketUnreservedMaker === true));
+}
+
 function reserveDrift(
   config: AppConfig,
   reservedOpenOrdersUsd: number,

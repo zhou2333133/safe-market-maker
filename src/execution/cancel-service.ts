@@ -202,6 +202,35 @@ export class CancelService {
     const nextReplaceConfirmState = new Map<string, FastReplaceConfirmEntry>();
     const now = Date.now();
 
+    // Pre-pass: collect all orders requiring naked-rest REST verification and run them CONCURRENTLY.
+    // Each verifyNakedOrderViaRest is a bounded REST call (max 2s). Without this pre-pass they would
+    // run serially inside the main loop — 5 naked orders × 2s = 10s delay before any cancel decision.
+    const nakedRestResults = new Map<string, Awaited<ReturnType<CancelService['verifyNakedOrderViaRest']>>>();
+    {
+      const pending: Array<{ orderId: string; order: OpenOrder; market: Market }> = [];
+      for (const order of managedOpenOrders) {
+        if (!managedTokens.has(order.tokenId)) continue;
+        const market = marketByToken.get(order.tokenId);
+        if (!market) continue;
+        const book = books.get(order.tokenId);
+        const orderAgeMs = order.placedAt ? now - order.placedAt : 0;
+        if (orderAgeMs > 30_000 && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
+          pending.push({ orderId: order.externalId, order, market });
+        }
+      }
+      if (pending.length > 0) {
+        const results = await Promise.all(
+          pending.map(async ({ orderId, order, market }) => {
+            const result = await this.verifyNakedOrderViaRest(venue, order, market, books);
+            return { orderId, result };
+          })
+        );
+        for (const { orderId, result } of results) {
+          nakedRestResults.set(orderId, result);
+        }
+      }
+    }
+
     for (const order of managedOpenOrders) {
       if (!managedTokens.has(order.tokenId)) continue;
       const desired = desiredByTokenSide.get(`${order.tokenId}:${order.side}`);
@@ -216,24 +245,19 @@ export class CancelService {
       // brief WS bursts don't churn the order — that path's behavior is unchanged.
       const orderAgeMs = order.placedAt ? Date.now() - order.placedAt : 0;
       const longNakedRest = orderAgeMs > 30_000;
-      if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
-        // Before the safety cancel fires, try ONE bounded REST fetch to get a fresh book and re-run the same
-        // depth checks that shouldRetreatThinFront would have run. Three outcomes:
-        //   (a) REST returns a healthy book → keep the order, prime the WS cache so the next ticks reuse it.
-        //   (b) REST returns a book that actually shows retreat conditions → cancel for the real reason.
-        //   (c) REST fails / times out → fall back to the original panic cancel (safety never reduced).
-        // This kills the "no WS push for quiet markets" false-cancel pattern that ate ~240 Predict cancels/day
-        // without weakening the POLY @ 0.437 protection the longNakedRest check was originally added for.
-        const verifyResult = await this.verifyNakedOrderViaRest(venue, order, market, books);
-        if (verifyResult.keep) {
-          // The freshly fetched book is also stashed back into `books` so any downstream checks in this same
-          // cycle (replace decision, GTD refresh) see it as fresh — they share the same Map by reference.
+
+      // Check pre-pass result FIRST — the concurrent pre-pass may have already stashed a
+      // fresh book via verifyNakedOrderViaRest, which would change the (!book || isStaleBook)
+      // condition below. Pre-pass result is authoritative.
+      const preVerify = nakedRestResults.get(order.externalId);
+      if (preVerify) {
+        if (preVerify.keep) {
           this.store.recordEvent({
             venue,
             severity: 'info',
             type: 'quote.protect-rest-verify-kept',
             message: `REST 验证盘口仍健康,保留 ${order.externalId.slice(0, 18)}…`,
-            details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: verifyResult.reason }
+            details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: preVerify.reason }
           });
           // Fall through to subsequent checks (shouldRetreatThinFront / replace decision) using the fresh book.
         } else {
@@ -242,19 +266,22 @@ export class CancelService {
             orderId: order.externalId,
             tokenId: order.tokenId,
             side: order.side,
-            reason: verifyResult.reason
+            reason: preVerify.reason
           });
           this.store.recordEvent({
             venue,
-            severity: verifyResult.verified ? 'warn' : 'info',
-            type: verifyResult.verified ? 'quote.protect-rest-verify-canceled' : 'quote.protect-rest-verify-failed',
-            message: verifyResult.verified
+            severity: preVerify.verified ? 'warn' : 'info',
+            type: preVerify.verified ? 'quote.protect-rest-verify-canceled' : 'quote.protect-rest-verify-failed',
+            message: preVerify.verified
               ? `REST 验证后真的不安全,撤 ${order.externalId.slice(0, 18)}…`
               : `REST 验证调用失败,回退到原裸奔撤单 ${order.externalId.slice(0, 18)}…`,
-            details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: verifyResult.reason }
+            details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: preVerify.reason }
           });
           continue;
         }
+      } else if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
+        // Defensive: only reached if pre-pass missed this order (shouldn't happen in practice).
+        continue;
       }
       const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
       if (retreat) {
@@ -377,7 +404,7 @@ export class CancelService {
         if (
           options.requireFreshReplacementForObsoleteCashOrders
           && !isPairedEntryMode(this.config)
-          && !hasFreshReplacementIntent(this.config, order, intents, books)
+          && !hasFreshMarketDataAvailable(this.config, order, intents, books)
         ) {
           deferredReasons.push({ orderId: order.externalId, tokenId: order.tokenId, side: order.side, reason: '新目标盘口尚未通过新鲜度检查，保留现有订单等待下一轮复检' });
           continue;
@@ -509,7 +536,16 @@ export class CancelService {
   }
 }
 
-function hasFreshReplacementIntent(
+/**
+ * Market-data-pipeline health probe. Returns true when at least one active intent (for ANY token, not
+ * necessarily this order's) has a fresh orderbook. This signals that the route/quote pipeline produced
+ * results from current market data — so when THIS order has no intent, that absence is real (the market
+ * genuinely no longer qualifies) rather than an artifact of stale data.
+ *
+ * Intentionally skips intents for this order's own tokenId — those would have been matched as `desired`
+ * upstream and would not reach this check.
+ */
+function hasFreshMarketDataAvailable(
   config: AppConfig,
   order: OpenOrder,
   intents: OrderIntent[],
@@ -686,6 +722,11 @@ function readCashMaintenanceStaleState(value: unknown): Map<string, CashMaintena
   return result;
 }
 
+/**
+ * Predict-only: cash-protected BUY orders on Predict venues qualify for REST-based verify-before-cancel
+ * (longNakedRest path). Polymarket unreserved maker BUY orders are protected by A-3 WS book retreat instead —
+ * Predict has no WS book pushes for quiet/no-trade markets, so the REST verify path fills that gap.
+ */
 function isCashProtectedBuyOrder(config: AppConfig, order: OpenOrder, market: Market): boolean {
   return config.strategy.entryMode === 'cash'
     && !isPairedEntryMode(config)

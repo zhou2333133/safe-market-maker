@@ -129,6 +129,19 @@ export class MarketDataSyncService {
     return getSharedCachedMarkets(this.config, venue, this.adapter, this.store);
   }
 
+  /**
+   * Synchronous cache-only market lookup. Returns undefined on cache miss — never triggers a REST fetch.
+   * Used by WS hot paths (protectOnBookUpdate) that must stay sub-millisecond.
+   */
+  getMarketFromCache(venue: VenueName, tokenId: string): Market | undefined {
+    const key = `${venue}:${this.adapter?.constructor?.name ?? 'readonly'}:${marketCacheFingerprint(this.config)}`;
+    const cached = marketCache.get(key);
+    if (!cached) return undefined;
+    const ttl = this.config.strategy.marketRefreshMs ?? 60000;
+    if (Date.now() - cached.ts >= ttl) return undefined;
+    return cached.markets.find((m) => m.tokenId === tokenId);
+  }
+
   private async syncOrderbooks(venue: VenueName, markets: Market[], openOrderMarkets?: Market[]): Promise<{ books: Map<string, Orderbook>; failedTokenIds: Set<string> }> {
     const books = new Map<string, Orderbook>();
     const failedTokenIds = new Set<string>();

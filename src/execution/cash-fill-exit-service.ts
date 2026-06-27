@@ -349,6 +349,11 @@ function clampLossFloorToTick(price: number, tickSize: number): number {
   return Number(Math.max(tick, Math.min(1 - tick, ticks * tick)).toFixed(6));
 }
 
+/**
+ * @deprecated Only reachable when CashFillExitInput.force === true, which is never set by any production code
+ * path. Daily-loss-limit killExit and cash fill circuit-breaker both use force:false (sellWithinLossCap).
+ * Kept for potential future manual emergency override.
+ */
 function forcedExitLimitPrice(config: AppConfig, market: Market, bestBid: number): number {
   const tick = Number.isFinite(market.tickSize) && market.tickSize > 0 ? market.tickSize : 0.01;
   const tickSlippage = Math.max(0, config.strategy.liquidationSlippageTicks ?? 2) * tick;
