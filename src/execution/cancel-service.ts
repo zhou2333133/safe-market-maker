@@ -296,6 +296,10 @@ export class CancelService {
           const s = retreat.supportShortfall;
           reasons.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)}(${s.windowCents}¢ 窗口内)< $${s.requiredUsd}`);
         }
+        if (retreat.levelFailed) {
+          const lf = retreat.levelFailed;
+          reasons.push(`前方仅剩 ${lf.frontLevels} 档(需 ${lf.minLevels} 档)，队列位置暴露`);
+        }
         cancelReasons.push({
           orderId: order.externalId,
           tokenId: order.tokenId,
@@ -564,10 +568,14 @@ function isStaleBook(config: AppConfig, book: Orderbook): boolean {
 }
 
 /**
- * Fast-retreat decision: re-validate the LIVE protections of a resting cash BUY on a FRESH book — currently checks
- * BOTH (a) front cushion eroded below polymarketRetreatFrontDepthUsd AND (b) the rear-support 1¢ window can no longer
- * absorb the order size. Either trigger means the placement protections have been undermined and a taker is about to
- * reach us OR an eaten fill could not be exited at ≤1¢ slippage. Stale books are never trusted to retreat.
+ * Fast-retreat decision: re-validate the LIVE protections of a resting cash BUY on a FRESH book — checks
+ * THREE conditions:
+ * (a) front cushion eroded below retreat floor USD
+ * (b) rear-support window can no longer absorb the order size
+ * (c) fewer than N distinct price levels ahead — other market makers vacated, exposing us at the front
+ *
+ * Any trigger means the placement protections have been undermined and a taker is about to reach us.
+ * Stale books are never trusted to retreat.
  *
  * Both checks are venue-independent (POLY uses polymarketRetreatFrontDepthUsd + cashSupportWindowCents in its
  * strategy block; Predict uses its OWN values in predictParams.strategy — modules stay fully independent).
@@ -578,7 +586,7 @@ export function shouldRetreatThinFront(
   order: OpenOrder,
   market: Market | undefined,
   book: Orderbook | undefined
-): { frontDepthUsd: number; floorUsd: number; supportShortfall?: { exitDepthUsd: number; requiredUsd: number; windowCents: number } } | null {
+): { frontDepthUsd: number; floorUsd: number; supportShortfall?: { exitDepthUsd: number; requiredUsd: number; windowCents: number }; levelFailed?: { frontLevels: number; minLevels: number } } | null {
   if (config.strategy.entryMode !== 'cash' || isPairedEntryMode(config)) return null;
   if (order.side !== 'BUY' || !market || !book || market.venue !== venue) return null;
   if (isStaleBook(config, book)) return null;
@@ -607,8 +615,18 @@ export function shouldRetreatThinFront(
       supportShortfall = { exitDepthUsd: Number(exitDepthUsd.toFixed(4)), requiredUsd, windowCents };
     }
   }
-  if (!frontFailed && !supportShortfall) return null;
-  return { frontDepthUsd, floorUsd, ...(supportShortfall ? { supportShortfall } : {}) };
+  // (c) Queue-position retreat. Even if front USD depth is fine, if the number of DISTINCT price levels ahead
+  // has dropped below the configured minimum, other market makers have vacated and we are now exposed at the
+  // front of the queue. The order was placed behind N levels — if that count fell, retreat.
+  const minLevels = Math.max(1, config.strategy.conservativeDepthLevel ?? 3);
+  const pricesAhead = new Set<number>();
+  for (const level of book.bids ?? []) {
+    if (level.price > order.price + 1e-9) pricesAhead.add(level.price);
+  }
+  const frontLevels = pricesAhead.size;
+  const levelFailed = frontLevels < minLevels;
+  if (!frontFailed && !supportShortfall && !levelFailed) return null;
+  return { frontDepthUsd, floorUsd, ...(supportShortfall ? { supportShortfall } : {}), ...(levelFailed ? { levelFailed: { frontLevels, minLevels } } : {}) };
 }
 
 function cashMaintenanceBookUnavailableDecision(

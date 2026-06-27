@@ -995,6 +995,10 @@ export class ExecutionEngine {
           const s = retreat.supportShortfall;
           parts.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)} (${s.windowCents}¢ 窗口内) < 需要 $${s.requiredUsd}`);
         }
+        if (retreat.levelFailed) {
+          const lf = retreat.levelFailed;
+          parts.push(`前方仅剩 ${lf.frontLevels} 档(需 ${lf.minLevels} 档)，队列位置暴露`);
+        }
         reasons.push({ orderId: order.externalId, reason: parts.join(' + ') });
       }
       if (toCancel.length === 0) return;
