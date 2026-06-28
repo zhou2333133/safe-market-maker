@@ -335,11 +335,17 @@ async function handleRequest(
   // Inject stored passphrase into body when body doesn't include one
   const bodyWithPassphrase = async (): Promise<unknown> => {
     const body = await readJson(req);
-    if (typeof body === 'object' && body && !(body as Record<string, unknown>).passphrase) {
-      const venue = (body as Record<string, unknown>).venue;
-      if (typeof venue === 'string' && (venue === 'polymarket' || venue === 'predict')) {
-        const stored = getPassphrase(venue);
-        if (stored) (body as Record<string, unknown>).passphrase = stored;
+    if (typeof body === 'object' && body) {
+      const b = body as Record<string, unknown>;
+      if (!b.passphrase || b.passphrase === '') {
+        const venue = b.venue;
+        if (typeof venue === 'string' && (venue === 'polymarket' || venue === 'predict')) {
+          const stored = getPassphrase(venue);
+          if (stored) {
+            b.passphrase = stored;
+            logger.info('BodyWithPassphrase: injected stored passphrase', { venue });
+          }
+        }
       }
     }
     return body;
