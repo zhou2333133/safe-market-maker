@@ -13,6 +13,7 @@ import { cancelAll, manualOrder } from './manual-controller.js';
 import { redact, redactString } from '../observability/redact.js';
 import { publicErrorMessage } from '../observability/error-message.js';
 import { logger } from '../observability/logger.js';
+import { clearPassphrase, getPassphrase, isUnlocked, setPassphrase } from './passphrase-store.js';
 export { submitLiveManualOrder } from './manual-controller.js';
 
 export interface UiServerOptions {
@@ -330,16 +331,64 @@ async function handleRequest(
   if (req.method === 'GET' && url.pathname === '/api/recommendations') return sendJson(res, 200, await recommendations(configPath, url));
   if (req.method === 'GET' && url.pathname === '/api/orderbook') return sendJson(res, 200, await orderbook(configPath, url));
   if (req.method === 'GET' && url.pathname === '/api/route-audit') return sendJson(res, 200, await routeAudit(configPath, url));
-  if (req.method === 'POST' && url.pathname === '/api/balances') return sendJson(res, 200, await balances(configPath, await readJson(req)));
-  if (req.method === 'POST' && url.pathname === '/api/startup-facts') return sendJson(res, 200, await startupFacts(configPath, await readJson(req)));
-  if (req.method === 'POST' && url.pathname === '/api/polymarket/grant-approvals') return sendJson(res, 200, await grantPolymarketApprovals(configPath, await readJson(req)));
+
+  // Inject stored passphrase into body when body doesn't include one
+  const bodyWithPassphrase = async (): Promise<unknown> => {
+    const body = await readJson(req);
+    if (typeof body === 'object' && body && !(body as Record<string, unknown>).passphrase) {
+      const venue = (body as Record<string, unknown>).venue;
+      if (typeof venue === 'string' && (venue === 'polymarket' || venue === 'predict')) {
+        const stored = getPassphrase(venue);
+        if (stored) (body as Record<string, unknown>).passphrase = stored;
+      }
+    }
+    return body;
+  };
+
+  if (req.method === 'POST' && url.pathname === '/api/balances') return sendJson(res, 200, await balances(configPath, await bodyWithPassphrase()));
+  if (req.method === 'POST' && url.pathname === '/api/startup-facts') return sendJson(res, 200, await startupFacts(configPath, await bodyWithPassphrase()));
+  if (req.method === 'POST' && url.pathname === '/api/polymarket/grant-approvals') return sendJson(res, 200, await grantPolymarketApprovals(configPath, await bodyWithPassphrase()));
   if (req.method === 'POST' && url.pathname === '/api/recommendations/apply') return sendJson(res, 200, await applyRecommendations(configPath, await readJson(req)));
   if (req.method === 'POST' && url.pathname === '/api/config/trading') return sendJson(res, 200, await updateTradingConfig(configPath, await readJson(req)));
-  if (req.method === 'POST' && url.pathname === '/api/live/start') return sendJson(res, 200, await liveStart(configPath, await readJson(req), liveLoops));
+  if (req.method === 'POST' && url.pathname === '/api/live/start') return sendJson(res, 200, await liveStart(configPath, await bodyWithPassphrase(), liveLoops));
   if (req.method === 'POST' && url.pathname === '/api/live/stop') return sendJson(res, 200, await liveStop(configPath, await readJson(req), liveLoops));
-  if (req.method === 'POST' && url.pathname === '/api/live/stop-and-cancel') return sendJson(res, 200, await liveStopAndCancel(configPath, await readJson(req), liveLoops));
+  if (req.method === 'POST' && url.pathname === '/api/live/stop-and-cancel') return sendJson(res, 200, await liveStopAndCancel(configPath, await bodyWithPassphrase(), liveLoops));
   if (req.method === 'POST' && url.pathname === '/api/manual-order') return sendJson(res, 200, await manualOrder(configPath, await readJson(req)));
-  if (req.method === 'POST' && url.pathname === '/api/cancel-all') return sendJson(res, 200, await cancelAll(configPath, await readJson(req)));
+  if (req.method === 'POST' && url.pathname === '/api/cancel-all') return sendJson(res, 200, await cancelAll(configPath, await bodyWithPassphrase()));
+
+  // -- unlock: 前端输入密码后存入服务器内存，直到进程重启才清除 --
+  if (req.method === 'POST' && url.pathname === '/api/unlock') {
+    const body = await readJson(req) as Record<string, unknown>;
+    const venue = typeof body.venue === 'string' ? body.venue : null;
+    const passphrase = typeof body.passphrase === 'string' ? body.passphrase : '';
+    if (!venue || (venue !== 'polymarket' && venue !== 'predict')) {
+      return sendJson(res, 400, { ok: false, message: 'venue 必须是 polymarket 或 predict' });
+    }
+    if (!passphrase) {
+      return sendJson(res, 400, { ok: false, message: '密码不能为空' });
+    }
+    // 验证密码是否正确：尝试用密码解密 keystore
+    try {
+      const { loadWalletSigner } = await import('../secrets/keystore.js');
+      const { loadConfig } = await import('../config/load.js');
+      const loaded = loadConfig(configPath);
+      loadWalletSigner(loaded.dataDir, venue, passphrase);
+      setPassphrase(venue, passphrase);
+      return sendJson(res, 200, { ok: true, venue, unlocked: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return sendJson(res, 401, { ok: false, venue, unlocked: false, message: `密码错误: ${message}` });
+    }
+  }
+  if (req.method === 'GET' && url.pathname === '/api/unlock/status') {
+    const url2 = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    const venue = url2.searchParams.get('venue');
+    if (!venue || (venue !== 'polymarket' && venue !== 'predict')) {
+      return sendJson(res, 400, { ok: false, message: 'venue 参数必填 (polymarket 或 predict)' });
+    }
+    return sendJson(res, 200, { ok: true, venue, unlocked: isUnlocked(venue) });
+  }
+
   throw new UiError(404, 'Not found');
 }
 

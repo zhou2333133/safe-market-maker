@@ -189,4 +189,62 @@ async function waitForLiveStatus(venue, finalStatuses, timeoutMs) {
   }
   return null;
 }
+
+// -- unlock: 输入一次 keystore 密码，服务端内存记住，重启才清除 --
+
+async function unlockVenue() {
+  const venue = state.activeVenue || 'polymarket';
+  const input = $('unlockPassphrase');
+  if (!input) return;
+  const passphrase = input.value.trim();
+  if (!passphrase) {
+    setAlert('error', '请输入 keystore 密码。');
+    return;
+  }
+  const btn = $('unlockBtn');
+  btn.disabled = true;
+  btn.textContent = '验证中...';
+  try {
+    const result = await api('/api/unlock', { method: 'POST', body: { venue, passphrase } });
+    if (result.ok) {
+      $('unlockIcon').textContent = '🔓';
+      $('unlockLabel').textContent = '已解锁 — 重启后需重新输入';
+      input.style.display = 'none';
+      btn.style.display = 'none';
+      state.keystoreUnlocked = true;
+      setAlert('success', venueLabel[venue] + ' 已解锁');
+      await refresh();
+    } else {
+      setAlert('error', '密码错误: ' + (result.message || ''));
+    }
+  } catch (error) {
+    setAlert('error', errorMessage(error));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '解锁';
+  }
+}
+
+async function checkUnlockStatus() {
+  const venue = state.activeVenue || 'polymarket';
+  try {
+    const result = await api('/api/unlock/status?venue=' + venue);
+    if (result.unlocked) {
+      $('unlockIcon').textContent = '🔓';
+      $('unlockLabel').textContent = '已解锁 — 重启后需重新输入';
+      $('unlockPassphrase').style.display = 'none';
+      $('unlockBtn').style.display = 'none';
+      state.keystoreUnlocked = true;
+    } else {
+      $('unlockIcon').textContent = '🔒';
+      $('unlockLabel').textContent = '点击解锁以加载钱包';
+      $('unlockPassphrase').style.display = '';
+      $('unlockBtn').style.display = '';
+      $('unlockPassphrase').placeholder = venue + ' keystore 密码';
+      state.keystoreUnlocked = false;
+    }
+  } catch {
+    // ignore
+  }
+}
 `;

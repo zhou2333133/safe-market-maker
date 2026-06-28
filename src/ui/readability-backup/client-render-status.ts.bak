@@ -135,8 +135,8 @@ function renderPolymarketReport(payload) {
   const wsh = payload.wsHealth && payload.wsHealth.polymarket && payload.wsHealth.polymarket.value;
   const wsBadge = wsh
     ? (wsh.connected
-        ? ' | <span class="ws-online">WS🟢实时盘口 缓存' + (wsh.cachedOrderbooks || 0) + '/订阅' + (wsh.watchedMarkets || 0) + '</span>'
-        : ' | <span class="ws-offline">WS🔴断线·REST兜底(盘口可能滞后→陈旧即撤)</span>')
+        ? ' | <span style="color:#98c379">WS🟢实时盘口 缓存' + (wsh.cachedOrderbooks || 0) + '/订阅' + (wsh.watchedMarkets || 0) + '</span>'
+        : ' | <span style="color:#e06c75">WS🔴断线·REST兜底(盘口可能滞后→陈旧即撤)</span>')
     : '';
   let html = '<div class="panel"><div class="panel-title">Polymarket 持仓报告 | ' + plOpen.length + ' 个活跃 | 今日预计 $' + totalDaily.toFixed(2)
     + ' | 名义 $' + notional.toFixed(0) + (bal !== undefined ? ' / 余额 $' + bal.toFixed(0) : '') + wsBadge + '</div>';
@@ -152,16 +152,16 @@ function renderPolymarketReport(payload) {
     const q = c.question || (c.market && c.market.question) || shortId(o.tokenId);
     const pp = typeof m.expectedPpPerHour === 'number' ? m.expectedPpPerHour : undefined;
     html += '<tr>';
-    html += '<td title="' + escapeHtml(String(q)) + '">' + escapeHtml(String(q).slice(0, 42)) + '</td>';
+    html += '<td>' + escapeHtml(String(q).slice(0, 42)) + '</td>';
     html += '<td><span class="pill buy">买 ' + escapeHtml(String(c.outcome || (c.market && c.market.outcome) || '')) + '</span></td>';
-    html += '<td class="num">' + (price !== undefined ? price.toFixed(3) : '---') + (price !== undefined && price >= 0.5 ? ' <span class="band ok">高价侧</span>' : '') + '</td>';
-    html += '<td class="num">' + exitLoss + '</td>';
-    html += '<td class="num"><strong>' + (pp !== undefined ? pp.toFixed(2) : '---') + '</strong></td>';
-    html += '<td class="num">' + (typeof m.targetSharePct === 'number' ? m.targetSharePct.toFixed(2) + '%' : '---') + '</td>';
-    html += '<td class="num">' + money(m.rewardBandDepthUsd) + '</td>';
+    html += '<td>' + (price !== undefined ? price.toFixed(3) : '---') + (price !== undefined && price >= 0.5 ? ' <span class="band ok">高价侧</span>' : '') + '</td>';
+    html += '<td>' + exitLoss + '</td>';
+    html += '<td><strong>' + (pp !== undefined ? pp.toFixed(2) : '---') + '</strong></td>';
+    html += '<td>' + (typeof m.targetSharePct === 'number' ? m.targetSharePct.toFixed(2) + '%' : '---') + '</td>';
+    html += '<td>' + money(m.rewardBandDepthUsd) + '</td>';
     html += '<td><span class="band ' + bandClass + '">' + competitionLabel(band) + '</span></td>';
-    html += '<td class="num">' + (typeof m.ppPerThousandUsd === 'number' ? m.ppPerThousandUsd.toFixed(2) + ' pt/k' : '---') + '</td>';
-    html += '<td class="num">$' + (price !== undefined && size !== undefined ? (price * size).toFixed(0) : '---') + '</td>';
+    html += '<td>' + (typeof m.ppPerThousandUsd === 'number' ? m.ppPerThousandUsd.toFixed(2) + ' pt/k' : '---') + '</td>';
+    html += '<td>$' + (price !== undefined && size !== undefined ? (price * size).toFixed(0) : '---') + '</td>';
     html += '</tr>';
   }
   html += '</tbody></table></div>';

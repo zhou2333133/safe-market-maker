@@ -55,7 +55,13 @@ export const appHtmlMarkup = String.raw`<!doctype html>
             <div><span>本轮风控</span><strong id="commandRisk">未同步</strong></div>
             <div><span>最近错误</span><strong id="commandError">无</strong></div>
           </div>
-          <div class="command-actions">
+          <div id="unlockRow" class="unlock-row" onclick="toggleUnlockInput()">
+            <span class="unlock-icon" id="unlockIcon">🔒</span>
+            <input id="unlockPassphrase" type="password" placeholder="输入 keystore 密码解锁" autocomplete="off" style="display:none" onclick="event.stopPropagation()">
+            <button id="unlockBtn" class="primary-btn" type="button" onclick="event.stopPropagation();unlockVenue()" style="display:none">解锁</button>
+            <span id="unlockLabel" style="font-size:13px;color:#8b7355">点击解锁以加载钱包</span>
+          </div>
+          <div class="command-actions" id="commandActions">
             <button id="startLiveBtn" class="primary-btn" type="button" title="开始实盘监控">开始实盘</button>
             <button id="startupFactsBtn" class="secondary-btn" type="button" title="检查启动条件">启动检查</button>
             <button id="refreshBalanceBtn" class="secondary-btn" type="button" title="刷新余额">刷新余额</button>

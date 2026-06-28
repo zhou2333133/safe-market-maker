@@ -12,6 +12,7 @@ function bind() {
   $('refreshBtn').addEventListener('click', () => refresh().catch((error) => setAlert('error', errorMessage(error))));
   $('liveVenue').addEventListener('change', () => {
     resetStartupFacts('平台已切换，请重新检查启动条件。');
+    checkUnlockStatus().catch(() => undefined);
     refresh().catch((error) => setAlert('error', errorMessage(error)));
   });
   $('startLiveBtn').addEventListener('click', () => startLive().catch((error) => setAlert('error', errorMessage(error))));
@@ -56,6 +57,7 @@ function bind() {
 }
 
 bind();
+checkUnlockStatus().catch(() => undefined);
 refresh().catch((error) => setAlert('error', errorMessage(error)));
 // Balance auto-refresh: silently fetch fresh balances on startup and every 30s, so the user never has to click 刷新余额.
 autoRefreshBalances().catch(() => undefined);

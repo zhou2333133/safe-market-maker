@@ -1,6 +1,8 @@
 export const clientStateScript = String.raw`
 const state = {
   side: 'BUY',
+  keystoreUnlocked: false,
+  activeVenue: 'predict',
   latestRecommendations: [],
   balances: null,
   startupFacts: null,
