@@ -103,6 +103,10 @@ export class PolymarketWsClient {
    *  on the next cycle (because the WS may have missed fills during the gap). 0 means "no disconnect since last
    *  successful subscribe", i.e. WS-stream-only is authoritative. */
   private userDisconnectedAt = 0;
+  private userReconnectAttempts = 0;
+  private userReconnectTimer?: NodeJS.Timeout;
+  /** Stored credentials so the user channel can auto-reconnect without waiting for the next engine cycle. */
+  private userCreds?: { key: string; secret: string; passphrase: string };
   private readonly userEvents: Array<{ type: string; data: unknown; receivedAt: number }> = [];
 
   constructor(private readonly wsUrl: string) {}
@@ -201,6 +205,7 @@ export class PolymarketWsClient {
    * Idempotent and best-effort: on any failure the bot keeps using REST as the source of truth.
    */
   async subscribeUser(creds: { key: string; secret: string; passphrase: string }, markets: string[] = []): Promise<void> {
+    this.userCreds = creds;
     if (this.userSubscribed && this.userSocket?.readyState === WebSocket.OPEN) return;
     if (this.userConnecting) return this.userConnecting;
     const userUrl = this.wsUrl.replace(/\/market\/?$/, '/user');
@@ -217,6 +222,7 @@ export class PolymarketWsClient {
         this.userSocket = socket;
         this.userConnecting = undefined;
         this.userSubscribed = true;
+        this.userReconnectAttempts = 0;
         this.lastUserActivityAt = Date.now();
         socket.on('message', (data) => this.onUserMessage(data));
         socket.on('pong', () => { this.lastUserActivityAt = Date.now(); });
@@ -328,6 +334,10 @@ export class PolymarketWsClient {
       clearInterval(this.userPingTimer);
       this.userPingTimer = undefined;
     }
+    if (this.userReconnectTimer) {
+      clearTimeout(this.userReconnectTimer);
+      this.userReconnectTimer = undefined;
+    }
   }
 
   private onUserDisconnect(): void {
@@ -342,6 +352,21 @@ export class PolymarketWsClient {
       clearInterval(this.userPingTimer);
       this.userPingTimer = undefined;
     }
+    // Auto-reconnect with exponential backoff (mirrors market-channel scheduleReconnect) so the user
+    // WS recovers independently, without waiting for the next engine cycle's primeUserStream call.
+    if (this.userCreds) this.scheduleUserReconnect();
+  }
+
+  private scheduleUserReconnect(): void {
+    if (!this.keepAlive || !this.userCreds || this.userReconnectTimer || this.userConnecting) return;
+    const delay = Math.min(30_000, 500 * 2 ** Math.min(this.userReconnectAttempts, 6));
+    this.userReconnectAttempts += 1;
+    this.userReconnectTimer = setTimeout(() => {
+      this.userReconnectTimer = undefined;
+      if (!this.userCreds) return;
+      this.subscribeUser(this.userCreds, []).catch(() => this.scheduleUserReconnect());
+    }, delay);
+    this.userReconnectTimer.unref?.();
   }
 
   private onUserMessage(data: WebSocket.RawData): void {

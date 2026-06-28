@@ -190,9 +190,15 @@ export function parsePolymarketTrade(record: Record<string, unknown>, receivedAt
   //   - record.maker_orders absent (taker-side perspective or single-maker wire shape) → use record.size
   //   - bot not in maker_orders (bot was the taker) → use record.size, which IS the taker's full size
   let size = tradeTotalSize;
+  // When the bot is one of N makers, the trade's aggregate price is the taker's price, not the bot's.
+  // Aggregate a weighted-average price from the bot's own maker_orders entries so the recorded price
+  // and notional match what the bot actually transacted at.
+  let makerWeightedPrice: number | undefined;
+  let makerTokenId: string | undefined;
   if (botAddress && Array.isArray(record.maker_orders)) {
     const lower = botAddress.toLowerCase();
     let botMatched = 0;
+    let botNotional = 0;
     let foundBotMaker = false;
     for (const entry of record.maker_orders) {
       if (!entry || typeof entry !== 'object') continue;
@@ -200,17 +206,31 @@ export function parsePolymarketTrade(record: Record<string, unknown>, receivedAt
       const addr = stringOrUndefined(row.maker_address ?? row.makerAddress);
       if (!addr || addr.toLowerCase() !== lower) continue;
       const matched = numberOrUndefined(row.matched_amount ?? row.matchedAmount);
+      const entryPrice = numberOrUndefined(row.price);
       if (matched !== undefined && matched > 0) {
         botMatched += matched;
+        if (entryPrice !== undefined && entryPrice > 0) botNotional += matched * entryPrice;
+        // Capture the maker's own asset_id — the trade's record.asset_id is the taker's view;
+        // multi-maker cross-asset trades bundle assets under different ids.
+        if (!makerTokenId) {
+          const entryAssetId = stringOrUndefined(row.asset_id ?? row.assetId);
+          if (entryAssetId) makerTokenId = entryAssetId;
+        }
         foundBotMaker = true;
       }
     }
-    if (foundBotMaker && botMatched > 0) size = Number(botMatched.toFixed(8));
+    if (foundBotMaker && botMatched > 0) {
+      size = Number(botMatched.toFixed(8));
+      if (botNotional > 0) makerWeightedPrice = Number((botNotional / botMatched).toFixed(8));
+    }
   }
-  if (price === undefined || size === undefined || price <= 0 || size <= 0) return undefined;
+  const effectivePrice = makerWeightedPrice ?? price;
+  if (effectivePrice === undefined || size === undefined || effectivePrice <= 0 || size <= 0) return undefined;
   const rawSide = stringOrUndefined(record.side)?.toUpperCase();
   const side: 'BUY' | 'SELL' | undefined = rawSide === 'BUY' || rawSide === 'SELL' ? rawSide as 'BUY' | 'SELL' : undefined;
-  const tokenId = stringOrUndefined(record.asset_id ?? record.assetId ?? record.token_id ?? record.tokenId);
+  // Prefer maker-specific asset_id over trade-level: in cross-asset fills the trade record's
+  // asset_id is the taker's view and may differ from the bot's matched asset.
+  const tokenId = makerTokenId || stringOrUndefined(record.asset_id ?? record.assetId ?? record.token_id ?? record.tokenId);
   const marketId = stringOrUndefined(record.market ?? record.market_id ?? record.marketId);
   const orderId = stringOrUndefined(record.taker_order_id ?? record.takerOrderId ?? record.maker_order_id ?? record.makerOrderId ?? record.order_id ?? record.orderId);
   const feeUsd = numberOrUndefined(record.fee ?? record.fee_usd ?? record.feeUsd);
@@ -228,9 +248,9 @@ export function parsePolymarketTrade(record: Record<string, unknown>, receivedAt
     tokenId,
     marketId,
     side,
-    price,
+    price: effectivePrice,
     size,
-    notionalUsd: price * size,
+    notionalUsd: effectivePrice * size,
     feeUsd,
     fillTs
   };

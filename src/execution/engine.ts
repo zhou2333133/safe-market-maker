@@ -468,27 +468,32 @@ export class ExecutionEngine {
       return {};
     }
     const cashPause = this.cashNewOrderPause(options.venue);
-    if (cashPause.active) {
+    const dbDegraded = this.store.dbWriteDegraded();
+    if (cashPause.active || dbDegraded) {
+      const reason = dbDegraded
+        ? 'SQLite 写入路径连续失败，暂停新增挂单（保护性撤单已执行）'
+        : `现金单边新挂单暂停：${cashPause.reason}`;
+      const type = dbDegraded ? 'db.write-degraded.pause' : 'quote.new-orders-paused';
       this.recorder.runCheckpoint(options.venue, {
         skippedQuoting: true,
         cashNewOrderPaused: true,
-        pauseReason: cashPause.reason,
-        pausedUntil: cashPause.until
+        pauseReason: reason,
+        pausedUntil: cashPause.until,
+        dbDegraded: dbDegraded || undefined
       });
       this.store.recordEvent({
         venue: options.venue,
-        severity: 'warn',
-        type: 'quote.new-orders-paused',
-        message: `现金单边新挂单暂停：${cashPause.reason}`,
-        details: {
-          reason: cashPause.reason,
-          until: cashPause.until,
-          source: cashPause.source
-        }
+        severity: dbDegraded ? 'error' : 'warn',
+        type,
+        message: reason,
+        details: { reason, until: cashPause.until, dbDegraded: dbDegraded || undefined }
       });
-      this.stage(options.venue, 'idle', '现金单边新挂单短暂停止，本轮只做同步和撤单维护', {
+      this.stage(options.venue, 'idle', dbDegraded
+        ? 'DB 写入降级，本轮只做同步和撤单维护，不挂新单'
+        : '现金单边新挂单短暂停止，本轮只做同步和撤单维护', {
         reason: cashPause.reason,
-        until: cashPause.until
+        until: cashPause.until,
+        dbDegraded: dbDegraded || undefined
       });
       return {};
     }

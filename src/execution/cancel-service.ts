@@ -280,7 +280,17 @@ export class CancelService {
           continue;
         }
       } else if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
-        // Defensive: only reached if pre-pass missed this order (shouldn't happen in practice).
+        // Defensive: pre-pass missed this order (shouldn't happen in practice). Cancel rather than
+        // let a naked order sit unprotected — no fresh book means we can't verify protection,
+        // and keeping an order we can't supervise is worse than missing rewards.
+        cancelIds.add(order.externalId);
+        this.store.recordEvent({
+          venue,
+          severity: 'warn',
+          type: 'cancel.naked-order-defensive-cancel',
+          message: `防守分支：预扫描遗漏了受保护订单 ${order.externalId.slice(0, 14)}… 且盘口缺失/过期，撤单保安全`,
+          details: { orderId: order.externalId, tokenId: order.tokenId, side: order.side, hasBook: !!book, bookAgeMs: book ? Date.now() - book.receivedAt : undefined }
+        });
         continue;
       }
       const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);

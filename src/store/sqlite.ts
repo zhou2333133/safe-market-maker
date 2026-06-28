@@ -20,6 +20,8 @@ export class StateStore {
   private readonly observability: ObservabilityRepository;
   private readonly orders: OrderLedgerRepository;
   private readonly risks: RiskRepository;
+  private consecutiveWriteErrors = 0;
+  private lastWriteErrorAt = 0;
 
   constructor(dbPath: string) {
     mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -86,8 +88,21 @@ export class StateStore {
     message: string;
     details?: unknown;
   }): void {
-    this.observability.recordEvent(input);
+    try {
+      this.observability.recordEvent(input);
+      this.consecutiveWriteErrors = 0;
+    } catch (err) {
+      this.consecutiveWriteErrors += 1;
+      this.lastWriteErrorAt = Date.now();
+      // Forensic log (JSONL file) is the belt-and-suspenders fallback — it never depends on SQLite.
+    }
     forensicLogEvent(input);
+  }
+
+  /** Returns true when the DB write path has been failing recently — the engine uses this to enter
+   *  protect-only mode so no fresh orders are placed on stale data while the DB is down. */
+  dbWriteDegraded(): boolean {
+    return this.consecutiveWriteErrors >= 5 && Date.now() - this.lastWriteErrorAt < 120_000;
   }
 
   /** Most recent timestamp (epoch ms) for an event of the given (venue, type), or undefined when none. Used by the
