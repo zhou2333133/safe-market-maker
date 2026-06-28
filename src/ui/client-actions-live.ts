@@ -216,19 +216,20 @@ async function unlockVenue() {
       if (polyOk) parts.push('Polymarket');
       if (predictOk) parts.push('Predict');
       $('unlockLabel').textContent = parts.join('+') + ' 已解锁';
-      input.style.display = 'none';
-      btn.style.display = 'none';
+      btn.textContent = '已解锁';
+      btn.disabled = true;
       state.keystoreUnlocked = true;
       setAlert('success', parts.join('+') + ' 已解锁');
       await refresh();
     } else {
       setAlert('error', '密码不正确');
+      btn.textContent = '解锁';
+      btn.disabled = false;
     }
   } catch (error) {
     setAlert('error', errorMessage(error));
-  } finally {
-    btn.disabled = false;
     btn.textContent = '解锁';
+    btn.disabled = false;
   }
 }
 
@@ -240,20 +241,21 @@ async function checkUnlockStatus() {
     ]);
     const polyOk = poly.status === 'fulfilled' && poly.value.unlocked;
     const predictOk = predict.status === 'fulfilled' && predict.value.unlocked;
+    const btn = $('unlockBtn');
     if (polyOk || predictOk) {
       $('unlockIcon').textContent = '🔓';
       const parts = [];
       if (polyOk) parts.push('Polymarket');
       if (predictOk) parts.push('Predict');
       $('unlockLabel').textContent = parts.join('+') + ' 已解锁';
+      btn.textContent = '已解锁';
+      btn.disabled = true;
+      state.keystoreUnlocked = true;
     } else {
       $('unlockIcon').textContent = '🔒';
-      $('unlockLabel').textContent = '点击解锁以加载钱包';
-    }
-    if (polyOk && predictOk) {
-      $('unlockPassphrase').style.display = 'none';
-      $('unlockBtn').style.display = 'none';
-      state.keystoreUnlocked = true;
+      $('unlockLabel').textContent = '';
+      btn.textContent = '解锁';
+      btn.disabled = false;
     }
   } catch {
     // ignore
