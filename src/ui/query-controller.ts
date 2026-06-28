@@ -773,6 +773,9 @@ export async function balances(configPath: string, body: unknown): Promise<unkno
       details: { timeoutMs: BALANCE_REFRESH_TIMEOUT_MS }
     });
     const signer = loadSignerForUi(loaded.dataDir, venue, passphrase);
+    if (!signer) {
+      return { ok: false, venue, signerMissing: true, message: '需要输入 keystore 密码才能加载签名者' };
+    }
     const adapter = await createVenueForUi(loaded.config, loaded.dataDir, venue, signer, passphrase);
     const address = balanceAddress(loaded.config, venue, signer.address);
     const values = await withRequestTimeout(
@@ -812,6 +815,9 @@ export async function grantPolymarketApprovals(configPath: string, body: unknown
   const store = usingStore(loaded.dataDir);
   try {
     const signer = loadSignerForUi(loaded.dataDir, venue, passphrase);
+    if (!signer) {
+      return { ok: false, venue, signerMissing: true, message: '需要输入 keystore 密码才能加载签名者' };
+    }
     const adapter = await createVenueForUi(loaded.config, loaded.dataDir, venue, signer, passphrase);
     if (!adapter.grantTradingApprovals) throw new Error('Polymarket 适配器不支持一键授权。');
     store.recordEvent({ venue, severity: 'warn', type: 'ui.polymarket.approvals.requested', message: `用户点击一键授权(pUSD 授权=无上限 unlimited）` });
@@ -851,6 +857,9 @@ export async function startupFacts(configPath: string, body: unknown): Promise<u
       }
     });
     const signer = loadSignerForUi(loaded.dataDir, venue, passphrase);
+    if (!signer) {
+      return { ok: false, venue, signerMissing: true, message: '需要输入 keystore 密码才能加载签名者' };
+    }
     const adapter = await createVenueForUi(loaded.config, loaded.dataDir, venue, signer, passphrase);
     const address = balanceAddress(loaded.config, venue, signer.address);
     const [balancesResult, positionsResult, openOrdersResult, marketsResult, accountRiskResult] = await Promise.all([

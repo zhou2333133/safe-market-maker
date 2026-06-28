@@ -4,7 +4,7 @@ import type { Balance, Market, OrderIntent, OrderSide, VenueName } from '../doma
 import { dayStartTs } from '../risk/account-risk.js';
 import { accountRiskWindowStart } from '../risk/risk-window.js';
 import { loadWalletSigner } from '../secrets/keystore.js';
-import { loadRuntimeSigner } from '../secrets/runtime.js';
+import { hasRuntimePrivateKey, loadRuntimeSigner } from '../secrets/runtime.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import { marketRewardLevel as rewardLevelForMarket } from '../strategy/strategy-engine.js';
 import type { VenueAdapter } from '../venues/types.js';
@@ -95,9 +95,20 @@ export async function withRequestTimeout<T>(promise: Promise<T>, ms: number, err
   }
 }
 
-export function loadSignerForUi(dataDir: string, venue: VenueName, passphrase?: string): SignerProvider {
+export function loadSignerForUi(dataDir: string, venue: VenueName, passphrase?: string): SignerProvider | undefined {
+  if (passphrase) {
+    try {
+      return loadWalletSigner(dataDir, venue, passphrase);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new UiError(400, message);
+    }
+  }
+  // 无密码 + 无 runtime-secrets → 静默返回 undefined，让调用方跳过需要签名者的操作。
+  // 只在有运行时私钥（本机开发环境，有 SAFE_MM_PRIVATE_KEY 或 runtime-secrets）时才自动加载。
+  if (!hasRuntimePrivateKey(venue, dataDir)) return undefined;
   try {
-    return passphrase ? loadWalletSigner(dataDir, venue, passphrase) : loadRuntimeSigner(venue, dataDir);
+    return loadRuntimeSigner(venue, dataDir);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new UiError(400, message);

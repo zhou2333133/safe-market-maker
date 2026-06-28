@@ -7,6 +7,7 @@ import type { OpenOrder, Market } from '../domain/types.js';
 import { runPreflight } from '../execution/preflight.js';
 import { usingStore } from '../store/ui-store.js';
 import { HttpError } from '../venues/http.js';
+import { logger } from '../observability/logger.js';
 import { recordUiEvent } from './telemetry.js';
 import { UiError } from './errors.js';
 import { asRecord, createVenueForUi, loadSignerForUi, parseVenueParam } from './controller-utils.js';
@@ -75,7 +76,7 @@ export async function liveStart(configPath: string, body: unknown, liveLoops: Li
   }
   const passphrase = typeof request.passphrase === 'string' && request.passphrase ? request.passphrase : (process.env.SAFE_MM_PASSPHRASE ?? '');
   ensureDataDirs(loaded.dataDir);
-  let signer!: SignerProvider;
+  let signer: SignerProvider | undefined;
   const store = usingStore(loaded.dataDir);
   try {
     store.recordEvent({
@@ -86,6 +87,9 @@ export async function liveStart(configPath: string, body: unknown, liveLoops: Li
       details: { selectedMarkets: selectedCount, autoSelectMarkets: loaded.config.strategy.autoSelectMarkets }
     });
     signer = loadSignerForUi(loaded.dataDir, venue, passphrase);
+    if (!signer) {
+      throw new UiError(400, '需要 keystore 密码才能启动实盘交易。请输入密码后重试。');
+    }
     const adapter = await createVenueForUi(loaded.config, loaded.dataDir, venue, signer, passphrase);
     store.recordEvent({
       venue,
@@ -216,6 +220,10 @@ export function restoreLiveLoops(configPath: string, liveLoops: LiveLoops): void
         continue;
       }
       const signer = loadSignerForUi(loaded.dataDir, venue, '');
+      if (!signer) {
+        logger.warn('Auto-resume skipped: no signer available (VPS without runtime-secrets, requires manual passphrase entry)');
+        return;
+      }
       const resumedIntent = saveLiveRunIntent(loaded.dataDir, venue, 'auto-resume', 'UI/后端重启后按上次开始实盘意图自动恢复监控循环。');
       checkpointLiveSession(configPath, venue, resumedIntent.sessionStartedAt, 'auto-resume', '自动恢复沿用上次开始实盘时的本轮止损统计窗口');
       const loop = createLiveLoopState(venue, new Date(resumedIntent.sessionStartedAt), { restored: true, restartCount: 0 });
