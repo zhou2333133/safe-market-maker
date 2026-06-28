@@ -231,7 +231,13 @@ export class MarketDataSyncService {
           restFetched = true;
         } else if (wsWatch) {
           const cached = this.adapter.getCachedOrderbook?.(market.tokenId);
-          if (cached && Date.now() - cached.receivedAt <= this.config.risk.staleBookMs) {
+          // Predict quiet markets: WS cache exists but staleBookMs would reject it, forcing a REST
+          // fallback that hangs (~5.4s with retries) → "orderbook unavailable" → cycle slow → no new
+          // orders. The WS cache itself is bounded to 60s by predict.ts, and A-3 fires on real changes
+          // via WS push → protectOnBookUpdate. So for Predict, trust any existing WS cache regardless
+          // of age; Polymarket keeps the staleBookMs gate.
+          const maxAge = this.adapter.name === 'predict' ? Number.POSITIVE_INFINITY : this.config.risk.staleBookMs;
+          if (cached && Date.now() - cached.receivedAt <= maxAge) {
             book = cached;
             wsServed += 1;
           }
