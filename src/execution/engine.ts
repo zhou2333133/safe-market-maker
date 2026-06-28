@@ -545,7 +545,10 @@ export class ExecutionEngine {
     // late-arriving WS fill cannot race the place we're about to do.
     const placeLockRelease = await this.acquireProtectLock(options.venue);
     try {
-      const wsProtectAt = this.lastWsProtectAt.get(options.venue) ?? 0;
+      const wsProtectAt = Math.max(
+        this.lastWsProtectAt.get(options.venue) ?? 0,
+        (this.store.getCheckpoint(`ws-protect.${options.venue}`)?.value as Record<string, unknown> | undefined)?.lastProtectAt as number ?? 0
+      );
       if (wsProtectAt > cycleStartedAt) {
         this.store.recordEvent({
           venue: options.venue,

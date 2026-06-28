@@ -1,6 +1,9 @@
 import { ensureDataDirs, loadConfig } from '../config/load.js';
 import { venueDisplayName, venueLiveEnabled } from '../config/live-enabled.js';
 import { ExecutionEngine } from '../execution/engine.js';
+import { shouldRetreatThinFront } from '../execution/cancel-service.js';
+import type { AppConfig } from '../config/schema.js';
+import type { OpenOrder, Market } from '../domain/types.js';
 import { runPreflight } from '../execution/preflight.js';
 import { usingStore } from '../store/ui-store.js';
 import { HttpError } from '../venues/http.js';
@@ -388,7 +391,9 @@ async function runLiveLoop(
         } finally {
           store.close();
         }
-        await waitForNextCycle(loop, nextCycleMs);
+        await waitForNextCycleInterleaved(
+          loop, loaded.config, loaded.dataDir, venue, adapter, nextCycleMs
+        );
       } catch (error) {
         // Drop the cached adapter so the next attempt rebuilds a fresh client/credential/WS — the error may mean the
         // connection or credential went bad (e.g. a CLOB TLS/createApiKey failure).
@@ -410,6 +415,85 @@ async function runLiveLoop(
   } finally {
     liveAdapterCache.delete(venue);
     resetLoopRuntimeHandles(loop);
+  }
+}
+
+const FAST_RETREAT_INTERVAL_MS = 3000;
+const FAST_RETREAT_MAX_CANCELS = 5;
+const FAST_RETREAT_DEDUPE_MS = 10000;
+
+async function waitForNextCycleInterleaved(
+  loop: LiveLoopState,
+  config: AppConfig,
+  dataDir: string,
+  venue: VenueName,
+  adapter: Awaited<ReturnType<typeof createVenueForUi>>,
+  totalMs: number
+): Promise<void> {
+  let remaining = totalMs;
+  while (remaining > 0 && !loop.stopRequested) {
+    const chunk = Math.min(FAST_RETREAT_INTERVAL_MS, remaining);
+    await waitForNextCycle(loop, chunk);
+    remaining -= chunk;
+    if (venue === 'polymarket' && remaining > 0) {
+      try {
+        await runFastRetreat(config, dataDir, venue, adapter);
+      } catch {
+        // Best-effort: fast retreat failures must never kill the loop
+      }
+    }
+  }
+}
+
+async function runFastRetreat(
+  config: AppConfig,
+  dataDir: string,
+  venue: VenueName,
+  adapter: Awaited<ReturnType<typeof createVenueForUi>>
+): Promise<void> {
+  const store = usingStore(dataDir);
+  try {
+    const orders: OpenOrder[] = store.listManagedOpenOrders(venue)
+      .filter((o) => o.status === 'OPEN' && o.side === 'BUY');
+    if (orders.length === 0) return;
+
+    const toCancel: string[] = [];
+    const lastCancelCheckpoint = store.getCheckpoint(`ws-protect.${venue}`);
+    const lastCancelAt: number = (lastCancelCheckpoint?.value as Record<string, unknown> | undefined)?.lastProtectAt as number ?? 0;
+    const now = Date.now();
+
+    for (const order of orders) {
+      if (toCancel.length >= FAST_RETREAT_MAX_CANCELS) break;
+      if (now - lastCancelAt < FAST_RETREAT_DEDUPE_MS) break;
+
+      const book = adapter.getCachedOrderbook?.(order.tokenId);
+      if (!book) continue;
+
+      const market = {
+        venue: order.venue || venue,
+        tokenId: order.tokenId,
+        rewards: { enabled: true, maxSpreadCents: 3 }
+      } as Market;
+
+      const retreat = shouldRetreatThinFront(config, venue, order, market, book);
+      if (!retreat) continue;
+
+      toCancel.push(order.externalId);
+    }
+
+    if (toCancel.length === 0) return;
+
+    await adapter.cancelOrders(toCancel);
+    store.markOrdersCanceled(venue, toCancel);
+    store.checkpoint(`ws-protect.${venue}`, { lastProtectAt: Date.now() });
+    store.recordEvent({
+      venue,
+      severity: 'warn',
+      type: 'quote.fast-retreat',
+      message: `快速撤退检查撤单 ${toCancel.length} 单`
+    });
+  } finally {
+    store.close();
   }
 }
 
