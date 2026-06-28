@@ -356,20 +356,18 @@ export class ExecutionEngine {
       monitoredMarkets = activeMarkets;
       previousRouteTokenIds = this.previousRouteTokenIds(options.venue);
     } else {
-      // WS health gate (predict venue): when the WS is disconnected and NO cached orderbooks exist,
-      // skip the cycle — there's no data to work with. If cached orderbooks DO exist, allow the cycle
-      // to proceed using stale WS cache (market-data-sync trusts Predict's WS cache regardless of
-      // staleBookMs — see its wsWatch path). The WS reconnects independently via scheduleReconnect
-      // (predict-ws.ts), and watchMarkets in the next full sync triggers ensureConnected.
+      // WS health gate (predict venue): when the WS is reconnecting, skip market sync + new orders to
+      // avoid a REST-fallback storm (up to 1.8s per uncached market). The WS reconnects in <30s and
+      // the next cycle resumes full scanning automatically.
       const wsStats = this.adapter.wsWatchStats?.();
-      if (options.venue === 'predict' && wsStats && !wsStats.connected && wsStats.cachedOrderbooks === 0) {
-        this.stage(options.venue, 'ws-reconnecting', `WS 断线且无缓存(订阅 ${wsStats.watchedMarkets} 个市场)，跳过本轮`);
+      if (options.venue === 'predict' && wsStats && !wsStats.connected && wsStats.watchedMarkets > 0) {
+        this.stage(options.venue, 'ws-reconnecting', `WS 断线重连中(订阅 ${wsStats.watchedMarkets} 个市场)，跳过本轮市场同步和新增挂单`);
         this.recorder.event({
           venue: options.venue,
-          severity: 'info',
+          severity: 'warn',
           type: 'ws.health.skip-cycle',
-          message: 'Predict WS 断线且无缓存，跳过本轮',
-          details: { watchedMarkets: wsStats.watchedMarkets, cachedOrderbooks: wsStats.cachedOrderbooks }
+          message: 'Predict WS 断线，跳过本轮以避免 REST fallback 海量请求',
+          details: { watchedMarkets: wsStats.watchedMarkets }
         });
         return {};
       }
