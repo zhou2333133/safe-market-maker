@@ -3,7 +3,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { Balance, Market, OrderIntent, OrderSide, VenueName } from '../domain/types.js';
 import { dayStartTs } from '../risk/account-risk.js';
 import { accountRiskWindowStart } from '../risk/risk-window.js';
-import { loadWalletSigner } from '../secrets/keystore.js';
+import { loadWalletSigner, saveCredential } from '../secrets/keystore.js';
 import { hasRuntimePrivateKey, loadRuntimeSigner } from '../secrets/runtime.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import { marketRewardLevel as rewardLevelForMarket } from '../strategy/strategy-engine.js';
@@ -132,6 +132,11 @@ export async function createVenueForUi(
   if (!missingCredential) return adapter;
   const auth = await adapter.authenticate(signer);
   setRuntimeCredential(venue, auth.credential as never);
+  // Persist to disk so the credential survives process restart
+  if (passphrase) {
+    try { saveCredential(dataDir, venue, auth.name, auth.credential, passphrase); }
+    catch { /* best-effort; runtime (memory) credential takes precedence */ }
+  }
   const refreshed = createVenue(config, dataDir, venue, passphrase);
   refreshed.setRuntimeSigner?.(signer);
   return refreshed;
