@@ -99,6 +99,21 @@ export function evaluateMarketGuard(
   if (metrics.bidDepthUsd < config.risk.minDepthUsdPerSide || metrics.askDepthUsd < config.risk.minDepthUsdPerSide) {
     return block('depth-collapse', `盘口深度不足：bid ${metrics.bidDepthUsd.toFixed(2)} / ask ${metrics.askDepthUsd.toFixed(2)} USD`, { metrics });
   }
+  // 第二层过滤：价差过宽时，要求买盘深度足够支撑（防空心深度）
+  // 例如价差 1132 bps 需要 $566 买盘，$495 不过关
+  if (metrics.spreadBps !== undefined && metrics.spreadBps > config.risk.maxSpreadBps) {
+    const requiredDepth = metrics.spreadBps * 0.5;
+    const discount = config.risk.negRiskDepthDiscount ?? 0.6;
+    const effectiveBidDepth = market.negRisk
+      ? metrics.bidDepthUsd * discount
+      : metrics.bidDepthUsd;
+    if (effectiveBidDepth + 1e-9 < requiredDepth) {
+      const extra = market.negRisk ? ` (${(discount * 100).toFixed(0)}% negRisk 折扣后)` : '';
+      return block('depth-collapse',
+        `盘口买盘深度不足：$${effectiveBidDepth.toFixed(0)}，价差 ${metrics.spreadBps.toFixed(0)}bps 要求 $${requiredDepth.toFixed(0)}${extra}`,
+        { metrics });
+    }
+  }
   if (metrics.bboMoveCents !== undefined && metrics.bboMoveCents > config.risk.maxBboMoveCents) {
     return block('price-jump', `下单前 BBO 中位价跳动 ${metrics.bboMoveCents.toFixed(2)}c，超过 ${config.risk.maxBboMoveCents}c`, { metrics });
   }

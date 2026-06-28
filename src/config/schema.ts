@@ -29,7 +29,13 @@ const riskSchema = z.object({
   maxPrice: z.number().min(0).max(1).default(0.92),
   minSpreadBps: z.number().nonnegative().default(0),
   maxSpreadBps: z.number().positive().default(600),
-  requirePostOnly: z.boolean().default(true)
+  requirePostOnly: z.boolean().default(true),
+
+  // 流动性质量过滤：guard-skip 累积门控
+  marketGuardSkipWindowMs: z.number().nonnegative().default(300000),
+  marketGuardSkipMaxCount: z.number().int().nonnegative().default(2),
+  // 流动性质量过滤：negRisk 市场深度折扣率
+  negRiskDepthDiscount: z.number().min(0).max(1).default(0.6)
 }).default({});
 
 const strategySchema = z.object({

@@ -79,6 +79,8 @@ export interface MarketRouteSelection {
 export interface MarketRouteContext {
   positions?: Position[];
   openOrders?: OpenOrder[];
+  /** 第三层过滤：近期被市场守卫反复拦截的代币集合，路由时直接拒绝 */
+  unstableTokenIds?: Set<string>;
 }
 
 export function rankMarketRoutes(
@@ -139,6 +141,11 @@ export function rankMarketRoutes(
         } else if (sides.length === 0) riskFlags.push('当前挂单方向没有可执行库存');
         if (!book) riskFlags.push('盘口不可用');
         if (!guard.ok) riskFlags.push(guard.message);
+        // 第三层过滤：该代币近期被市场守卫反复拦截，盘口质量不稳定
+        if (context.unstableTokenIds?.has(market.tokenId)) {
+          const mins = Math.round((config.risk.marketGuardSkipWindowMs || 300000) / 60000);
+          riskFlags.push(`盘口质量不稳定：最近 ${mins} 分钟被市场守卫拦截 ${config.risk.marketGuardSkipMaxCount}+ 次，流动性不可靠`);
+        }
         if (!quoteDecision.ok) riskFlags.push(...quoteDecision.reasons);
         if (book && metrics.rewardBandDepthUsd < metrics.targetOrderUsd) {
           reasons.push(`同组奖励带现有竞争资金低于本单金额，按低竞争机会继续评估`);

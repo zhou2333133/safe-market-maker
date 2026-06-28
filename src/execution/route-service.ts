@@ -55,7 +55,17 @@ export class RouteService {
       };
     }
     const polymarketTwoSided = isPolymarketTwoSidedLp(this.config, venue);
-    const ranked = rankMarketRoutes(this.config, venue, markets, books, { positions, openOrders });
+    // 第三层过滤：guard-skip 累积计数 — 统计最近 windowMs 内每个代币被 guard 拦截的次数
+    const skipWindowMs = this.config.risk.marketGuardSkipWindowMs;
+    const skipMaxCount = this.config.risk.marketGuardSkipMaxCount;
+    const unstableTokens = (skipMaxCount > 0 && skipWindowMs > 0)
+      ? new Set<string>(
+          markets
+            .filter((m) => m.venue === venue && this.store.countRecentGuardSkips(venue, m.tokenId, skipWindowMs) >= skipMaxCount)
+            .map((m) => m.tokenId)
+        )
+      : new Set<string>();
+    const ranked = rankMarketRoutes(this.config, venue, markets, books, { positions, openOrders, unstableTokenIds: unstableTokens });
     const cooldown = buildCashFillCooldown(this.config, venue, this.store);
     const cooledRanked = isCashMultiMarketEntry(this.config) && !polymarketTwoSided
       ? ranked.map((candidate) => applyCashFillCooldown(candidate, cooldown))

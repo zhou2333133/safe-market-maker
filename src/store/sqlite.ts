@@ -168,6 +168,16 @@ export class StateStore {
     return this.orders.listManagedOpenOrders(venue);
   }
 
+  /** 统计某代币在最近 windowMs 毫秒内的 guard-skip 次数（路由用，判断市场是否稳定） */
+  countRecentGuardSkips(venue: VenueName, tokenId: string, windowMs: number): number {
+    const cutoff = Date.now() - windowMs;
+    const stmt = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM events WHERE venue = ? AND type = 'orderbook.guard-skip' AND message = ? AND ts > ?`
+    );
+    const row = stmt.get(venue, tokenId, cutoff) as { cnt: number } | undefined;
+    return row ? row.cnt : 0;
+  }
+
   listRecentOrders(limit = 20): RecentOrder[] {
     return this.orders.listRecentOrders(limit);
   }

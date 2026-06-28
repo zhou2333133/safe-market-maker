@@ -37,6 +37,9 @@ const RISK_PRESETS: Record<RiskPreset, { label: string; risk: AppConfig['risk'] 
       maxPrice: 0.92,
       minSpreadBps: 0,
       maxSpreadBps: 600,
+      marketGuardSkipWindowMs: 300000,
+      marketGuardSkipMaxCount: 2,
+      negRiskDepthDiscount: 0.6,
       requirePostOnly: true
     }
   },
@@ -66,6 +69,9 @@ const RISK_PRESETS: Record<RiskPreset, { label: string; risk: AppConfig['risk'] 
       maxPrice: 0.92,
       minSpreadBps: 0,
       maxSpreadBps: 600,
+      marketGuardSkipWindowMs: 300000,
+      marketGuardSkipMaxCount: 2,
+      negRiskDepthDiscount: 0.6,
       requirePostOnly: true
     }
   },
@@ -95,6 +101,9 @@ const RISK_PRESETS: Record<RiskPreset, { label: string; risk: AppConfig['risk'] 
       maxPrice: 0.92,
       minSpreadBps: 0,
       maxSpreadBps: 600,
+      marketGuardSkipWindowMs: 300000,
+      marketGuardSkipMaxCount: 2,
+      negRiskDepthDiscount: 0.6,
       requirePostOnly: true
     }
   }
