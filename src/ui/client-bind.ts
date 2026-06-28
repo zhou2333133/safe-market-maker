@@ -10,6 +10,43 @@ function bind() {
     });
   });
   $('refreshBtn').addEventListener('click', () => refresh().catch((error) => setAlert('error', errorMessage(error))));
+  // 解锁按钮: 注册点击事件，一次密码同时解锁两个场地
+  const unlockBtn = $('unlockBtn');
+  const unlockInput = $('unlockPassphrase');
+  if (unlockBtn) {
+    unlockBtn.addEventListener('click', () => {
+      const pw = unlockInput.value.trim();
+      if (!pw) { setAlert('error', '请输入 keystore 密码'); return; }
+      unlockBtn.disabled = true;
+      unlockBtn.textContent = '验证中...';
+      Promise.allSettled([
+        api('/api/unlock', { method: 'POST', body: { venue: 'polymarket', passphrase: pw } }),
+        api('/api/unlock', { method: 'POST', body: { venue: 'predict', passphrase: pw } })
+      ]).then(([poly, predict]) => {
+        const polyOk = poly.status === 'fulfilled' && poly.value.ok;
+        const predictOk = predict.status === 'fulfilled' && predict.value.ok;
+        if (polyOk || predictOk) {
+          const parts = [];
+          if (polyOk) parts.push('Polymarket');
+          if (predictOk) parts.push('Predict');
+          $('unlockIcon').textContent = '\u{1F513}';
+          $('unlockLabel').textContent = parts.join('+') + ' \u5DF2\u89E3\u9501';
+          unlockBtn.textContent = '\u5DF2\u89E3\u9501';
+          state.keystoreUnlocked = true;
+          setAlert('success', parts.join('+') + ' \u5DF2\u89E3\u9501');
+          refresh();
+        } else {
+          setAlert('error', '\u5BC6\u7801\u4E0D\u6B63\u786E');
+          unlockBtn.disabled = false;
+          unlockBtn.textContent = '\u89E3\u9501';
+        }
+      }).catch((err) => {
+        setAlert('error', errorMessage(err));
+        unlockBtn.disabled = false;
+        unlockBtn.textContent = '\u89E3\u9501';
+      });
+    });
+  }
   $('liveVenue').addEventListener('change', () => {
     resetStartupFacts('平台已切换，请重新检查启动条件。');
     checkUnlockStatus().catch(() => undefined);
