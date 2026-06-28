@@ -56,9 +56,9 @@ export const appHtmlMarkup = String.raw`<!doctype html>
             <div><span>最近错误</span><strong id="commandError">无</strong></div>
           </div>
           <div id="unlockRow" class="unlock-row">
-            <span class="unlock-icon" id="unlockIcon">🔒</span>
+            <span id="unlockIcon">🔒</span>
             <input id="unlockPassphrase" type="password" placeholder="keystore 密码" autocomplete="off">
-            <button id="unlockBtn" class="primary-btn" type="button" onclick="event.preventDefault();unlockVenue()">解锁</button>
+            <button id="unlockBtn" class="primary-btn" type="button">解锁</button>
             <span id="unlockLabel" style="font-size:13px;color:#8b7355"></span>
           </div>
           <div class="command-actions" id="commandActions">

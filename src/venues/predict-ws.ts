@@ -36,6 +36,11 @@ export class PredictWsClient {
   private readonly orderbooks = new Map<string, CachedOrderbook>();
   private readonly waiters = new Map<string, Waiter[]>();
   private readonly walletEvents: Array<{ topic: string; data: unknown; receivedAt: number }> = [];
+  /** Optional listener that fires after every predictOrderbook WS push. The engine uses this to re-evaluate
+   *  placement protections in real-time instead of waiting for the next cycle. The callback receives marketId
+   *  (not tokenId) because Predict WS pushes per-market orderbooks. Wrapped in try/catch at the invocation
+   *  site so a buggy listener can never tear down the WS reader. */
+  private bookUpdateListener?: ((marketId: string) => void);
   private keepAlive = false;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnectAttempts = 0;
@@ -143,6 +148,12 @@ export class PredictWsClient {
       watchedMarkets: this.watchedMarketCount(),
       keepAlive: this.keepAlive
     };
+  }
+
+  /** Register a listener that fires for every predictOrderbook WS push (per-market). The engine
+   *  wraps this to resolve marketId → affected tokenIds before calling protectOnBookUpdate. */
+  setBookUpdateListener(listener: ((marketId: string) => void) | undefined): void {
+    this.bookUpdateListener = listener;
   }
 
   close(): void {
@@ -259,6 +270,12 @@ export class PredictWsClient {
       for (const waiter of waiters) {
         clearTimeout(waiter.timer);
         waiter.resolve({ ...buildPredictWsOrderbook(waiter.tokenId, parsed.data, { complement: waiter.complement, complementTickSize: waiter.complementTickSize }), receivedAt });
+      }
+      // Fire book-update listener AFTER cache update — same order as Polymarket's pattern.
+      // Wrapped in try/catch so a buggy listener can never tear down the WS reader.
+      if (this.bookUpdateListener) {
+        try { this.bookUpdateListener(marketId); }
+        catch { /* swallow */ }
       }
       return;
     }

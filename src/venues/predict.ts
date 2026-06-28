@@ -300,6 +300,32 @@ export class PredictVenue implements VenueAdapter {
     this.wsClient().primeBook(tokenId, book);
   }
 
+  /** Engine-layer hook for "Predict WS pushed a market-level orderbook update — re-evaluate placement
+   *  protections for every token in that market". Predict WS pushes per-market (not per-token like POLY),
+   *  so we resolve marketId → affected tokenIds here. Passing undefined clears the listener. */
+  setBookUpdateListener(listener: ((tokenId: string, kind: 'snapshot' | 'price_change') => void) | undefined): void {
+    if (!listener) {
+      this.wsClient().setBookUpdateListener(undefined);
+      return;
+    }
+    // Resolve marketId → tokenIds via reverse lookup of tokenToMarketId.
+    // Predict WS pushes full orderbooks per market; we fan out to each token with managed orders.
+    const resolveTokenIds = (marketId: string): string[] => {
+      const ids: string[] = [];
+      for (const [tid, mid] of this.tokenToMarketId) {
+        if (mid === marketId && !this.closedMarketTokens.has(tid)) ids.push(tid);
+      }
+      return ids;
+    };
+    this.wsClient().setBookUpdateListener((marketId: string) => {
+      const tokenIds = resolveTokenIds(marketId);
+      for (const tokenId of tokenIds) {
+        try { listener(tokenId, 'snapshot'); }
+        catch { /* swallow — same protection as POLY's bookUpdateListener wrapper */ }
+      }
+    });
+  }
+
   wsWatchStats(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } {
     const stats = this.wsClient().stats();
     return { connected: stats.connected, watchedMarkets: stats.watchedMarkets, cachedOrderbooks: stats.cachedOrderbooks };

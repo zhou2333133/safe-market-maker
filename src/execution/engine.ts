@@ -130,13 +130,14 @@ export class ExecutionEngine {
       );
       this.adapter.setUserEventListener(handler.handle.bind(handler));
     }
-    // === A-3: market-channel WS book-update hook. Whenever POLY pushes a book snapshot or price_change delta,
-    // re-run the 3 placement protections on the just-updated book and cancel any resting order that no longer
-    // qualifies — without waiting for the next ~16s cycle. Predict's WS does not push book deltas, so it leaves
-    // this method undefined and the engine skips the wiring. POLY-only side-effect.
+    // === A-3: market-channel WS book-update hook. Whenever the venue pushes a book snapshot or price_change
+    // delta, re-run the 3 placement protections on the just-updated book and cancel any resting order that no
+    // longer qualifies — without waiting for the next ~16s cycle. Each venue's adapter implements
+    // setBookUpdateListener when its WS channel supports real-time book pushes (POLY: per-token;
+    // Predict: per-market, resolved to tokens in the adapter wrapper).
     if (typeof this.adapter.setBookUpdateListener === 'function') {
       this.adapter.setBookUpdateListener((tokenId) => {
-        void this.protectOnBookUpdate('polymarket', tokenId);
+        void this.protectOnBookUpdate(this.adapter.name, tokenId);
       });
     }
   }
