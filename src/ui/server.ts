@@ -91,31 +91,36 @@ function installGlobalRejectionGuard(): void {
   });
 }
 
+function extractHostname(hostHeader: string): string {
+  return hostHeader.split(':')[0]?.replace(/^\[|\]$/g, '') ?? '';
+}
+
 /** Same-origin check for mutation endpoints. Returns the expected serverInfo URL the request must match. */
 function isOriginAllowed(req: IncomingMessage, serverInfo: { host: string; port: number }): boolean {
   const origin = req.headers['origin'];
   const referer = req.headers['referer'];
-  const expectedHosts = new Set([
-    `${serverInfo.host}:${serverInfo.port}`,
-    `127.0.0.1:${serverInfo.port}`,
-    `localhost:${serverInfo.port}`
-  ]);
-  // No Origin AND no Referer: same-origin browser GETs sometimes omit Origin, but we only reach this for non-GET,
-  // so a missing Origin/Referer is suspicious. Allow only if the Host header itself is loopback (CLI curl flows).
+  // Allow any loopback host. SSH tunnels map to different local ports, but the request
+  // still originates from the local machine — the hostname is all that matters.
+  const loopbackHosts = new Set(['127.0.0.1', 'localhost', serverInfo.host]);
+  const loopbackHostAllowed = (host: string): boolean => {
+    if (loopbackHosts.has(host)) return true;
+    try {
+      // Also allow 127.0.0.2 – 127.255.255.254 (legitimate loopback aliases)
+      const u = new URL(`http://${host}/`);
+      return /^127\.\d+\.\d+\.\d+$/.test(u.hostname);
+    } catch { return false; }
+  };
   if (!origin && !referer) {
-    const host = String(req.headers['host'] ?? '');
-    return expectedHosts.has(host);
+    return loopbackHostAllowed(extractHostname(String(req.headers['host'] ?? '')));
   }
   if (origin) {
     try {
-      const o = new URL(String(origin));
-      return expectedHosts.has(o.host);
+      return loopbackHostAllowed(new URL(String(origin)).hostname);
     } catch { return false; }
   }
   if (referer) {
     try {
-      const r = new URL(String(referer));
-      return expectedHosts.has(r.host);
+      return loopbackHostAllowed(new URL(String(referer)).hostname);
     } catch { return false; }
   }
   return false;
