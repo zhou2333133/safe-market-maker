@@ -142,9 +142,37 @@ export class CashFillExitService {
           venue: input.venue,
           severity: 'warn',
           type: 'cash-fill.exit-blocked',
-          message: plan.reason,
+          message: `${plan.reason}，挂 limit SELL 在止损价等成交`,
           details: { position: publicPosition(position), market: publicMarket(market), book: publicBookTop(book), reject: plan.reject }
         });
+        // When the loss cap blocks a marketable exit, post a limit SELL at the loss-cap price.
+        // The order sits on the book earning rewards until filled or the position clears naturally.
+        // Using `${venue}:` prefix excludes it from listManagedOpenOrders, so circuit-breaker
+        // cancelAllManagedOrders leaves it alone.
+        if (this.adapter.createOrder && plan.limitPrice !== undefined) {
+          try {
+            const limitIntent: OrderIntent = {
+              venue: market.venue,
+              market,
+              tokenId: position.tokenId,
+              side: 'SELL',
+              price: plan.limitPrice,
+              size: position.size,
+              notionalUsd: Number((position.size * plan.limitPrice).toFixed(4)),
+              postOnly: true,
+              liquidity: 'maker',
+              reduceOnly: true,
+              reason: 'cash-fill-exit-limit-blocked',
+              clientOrderId: `${market.venue}:${position.tokenId}-exit-limit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+            };
+            const result = await this.adapter.createOrder(limitIntent, input.signer);
+            this.store.recordOrderResult(result);
+            submitted += 1;
+            this.markExitSubmitted(input.venue, position.tokenId);
+          } catch (_limitError) {
+            failed += 1;
+          }
+        }
         continue;
       }
 
@@ -202,6 +230,7 @@ type CashExitPlan =
       ok: false;
       reason: string;
       reject: ReturnType<typeof rejectReason>;
+      limitPrice?: number;
     };
 
 export function cashExitPlan(
@@ -246,7 +275,7 @@ export function cashExitPlan(
         liquidity: 'taker',
         reduceOnly: true,
         reason: 'account-hard-stop-force-exit',
-        clientOrderId: `${market.venue}-${position.tokenId}-hard-stop-exit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+        clientOrderId: `${market.venue}:${position.tokenId}-hard-stop-exit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
       },
       averagePrice: effectiveAveragePrice,
       limitPrice
@@ -265,7 +294,8 @@ export function cashExitPlan(
     return {
       ok: false,
       reason: `现金单边退出被止损线拦截：买一 ${best.bestBid.toFixed(4)} 低于最低可接受 ${limitPrice.toFixed(4)}`,
-      reject: rejectReason('CASH_EXIT_LOSS_CAP_BLOCKED', 'liquidation', 'cash-fill-exit')
+      reject: rejectReason('CASH_EXIT_LOSS_CAP_BLOCKED', 'liquidation', 'cash-fill-exit'),
+      limitPrice
     };
   }
   const sellableSize = depthAtOrAbove(book, limitPrice);
@@ -289,7 +319,7 @@ export function cashExitPlan(
     liquidity: 'taker',
     reduceOnly: true,
     reason: `cash-fill-exit-loss-cap-${maxLossPct}pct`,
-    clientOrderId: `${market.venue}-${position.tokenId}-cash-exit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+    clientOrderId: `${market.venue}:${position.tokenId}-cash-exit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
   };
   return { ok: true, intent, averagePrice, limitPrice };
 }
