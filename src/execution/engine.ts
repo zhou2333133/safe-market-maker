@@ -97,6 +97,7 @@ export class ExecutionEngine {
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
   // > cycleStartedAt, WS already cleared a position this cycle → skip placement to avoid re-pinning the token.
   private readonly lastWsProtectAt = new Map<VenueName, number>();
+  private readonly wsDisconnectedSince = new Map<VenueName, number>();
 
   constructor(
     private readonly config: AppConfig,
@@ -361,6 +362,14 @@ export class ExecutionEngine {
       // the next cycle resumes full scanning automatically.
       const wsStats = this.adapter.wsWatchStats?.();
       if (options.venue === 'predict' && wsStats && !wsStats.connected && wsStats.watchedMarkets > 0) {
+        const now = Date.now();
+        const firstDisconnectedAt = this.wsDisconnectedSince.get(options.venue);
+        if (firstDisconnectedAt === undefined) {
+          this.wsDisconnectedSince.set(options.venue, now);
+        } else if (now - firstDisconnectedAt > 120_000) {
+          this.wsDisconnectedSince.delete(options.venue);
+          throw new Error(`Predict WS reconnection timed out after ${Math.round((now - firstDisconnectedAt) / 1000)}s`);
+        }
         this.stage(options.venue, 'ws-reconnecting', `WS 断线重连中(订阅 ${wsStats.watchedMarkets} 个市场)，跳过本轮市场同步和新增挂单`);
         this.recorder.event({
           venue: options.venue,
@@ -371,6 +380,7 @@ export class ExecutionEngine {
         });
         return {};
       }
+      this.wsDisconnectedSince.delete(options.venue);
       this.stage(options.venue, 'syncing-markets', '同步候选市场和订单簿');
       const marketSnapshot = await this.marketDataSync.sync(options.venue, { openOrders, positions });
       markets = marketSnapshot.markets;
