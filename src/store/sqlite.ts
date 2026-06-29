@@ -12,7 +12,7 @@ import { configureForensicLog, forensicLogEvent, pruneOldForensicFiles } from '.
 // kept for 3d (cold archive, post-hoc complete record). Production observed ~1.5GB/day forensic growth (POLY's
 // order.ws-update fires ~2.3k/min and dominates), so 3d ≈ 4.5GB on disk — comfortable. Original 30d was sized
 // against a 60MB/day estimate that's ~25x off. Both auto-pruned at store-open so a long-running bot self-maintains.
-const SQLITE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const SQLITE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const FORENSIC_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 
 export class StateStore {

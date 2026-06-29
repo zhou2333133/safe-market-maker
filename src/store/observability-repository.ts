@@ -58,7 +58,8 @@ const NOISY_EVENT_TYPES = new Set([
   'orderbook.unhealthy',
   'open-orders.unavailable',
   'ws.book-stale',
-  'ws.user-channel-stale'
+  'ws.user-channel-stale',
+  'orderbook.guard-skip'
 ]);
 
 export class ObservabilityRepository {
