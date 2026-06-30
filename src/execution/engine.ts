@@ -27,6 +27,10 @@ const KILL_EXIT_MAX_ATTEMPTS = 8;
 // Wait between in-cycle kill-exit retries so chain-confirmed exits free up CTF/USDC balance before the next submit
 // (Polymarket rejects "not enough balance / allowance" until the on-chain settlement of the prior exit lands).
 const KILL_EXIT_BACKOFF_MS = 1500;
+// A-2 protectOnFill cooldown: after a WS fill triggers the full protect cycle (cancel+exit), suppress
+// re-triggering for the same token for 60s. This prevents WS replay floods from spinning repeated
+// protectOnFill / cancelManagedOrders / exit retries on fills that were already handled.
+const PROTECT_ON_FILL_COOLDOWN_MS = 60_000;
 const wsDisconnectedSince = new Map<VenueName, number>();
 
 export interface RunOnceOptions {
@@ -92,7 +96,8 @@ export class ExecutionEngine {
   // fill event always runs the stop-loss path, even when an A-3 book-retreat task happens to be in flight
   // for the same token. Production 2026-06-26 incident: a single shared Set let A-3 silently swallow A-2,
   // bot never tried to exit a fill and lost $76 before risk-stop kicked in.
-  private readonly protectingFillTokens = new Map<VenueName, Set<string>>();
+  private readonly protectingFillTokens = new Map<VenueName, Map<string, number>>();
+  private protectingFillCount = 0;
   // Per-(venue, tokenId) dedupe for A-3 (WS book update → retreat). Independent of fill dedupe.
   private readonly protectingBookTokens = new Map<VenueName, Set<string>>();
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
@@ -227,7 +232,8 @@ export class ExecutionEngine {
         options.venue,
         openOrders,
         '账户总止损触发',
-        'risk.daily-loss-stop.cancel-managed'
+        'risk.daily-loss-stop.cancel-managed',
+        signerAddress
       );
       let killExit: CashFillExitResult | undefined;
       let exitPositions = positions.filter((position) => position.venue === options.venue && isMaterialCashPosition(this.config, position));
@@ -701,7 +707,8 @@ export class ExecutionEngine {
       venue,
       openOrders,
       '现金单边成交/持仓保护',
-      'fill-circuit-breaker.cancel-managed'
+      'fill-circuit-breaker.cancel-managed',
+      options.signer.address
     );
     const markets = await this.cashExitMarkets(venue, positions);
     this.adapter.hydrateFromMarkets?.(markets);
@@ -868,14 +875,29 @@ export class ExecutionEngine {
    */
   async protectOnFill(venue: VenueName, tokenId: string, fillSize: number, fillPrice: number): Promise<void> {
     // Per-(venue, tokenId) dedupe — multiple partial fills on the same token collapse to ONE protect task.
-    // Uses the FILL-specific Set, separate from A-3's book-update dedupe so we never silently skip a stop-loss
+    // Uses the FILL-specific Map, separate from A-3's book-update dedupe so we never silently skip a stop-loss
     // because A-3 happens to be processing the same token (this collision caused the 2026-06-26 $76 incident).
+    // Map value is the last-protect timestamp; entries live for PROTECT_ON_FILL_COOLDOWN_MS to suppress
+    // WS replay floods from spinning repeated cancelManagedOrders + exit cycles on fills already handled.
     let perVenue = this.protectingFillTokens.get(venue);
     if (!perVenue) {
-      perVenue = new Set<string>();
+      perVenue = new Map<string, number>();
       this.protectingFillTokens.set(venue, perVenue);
     }
-    if (perVenue.has(tokenId)) return;
+    const lastProtected = perVenue.get(tokenId);
+    const now = Date.now();
+    if (lastProtected !== undefined && now - lastProtected < PROTECT_ON_FILL_COOLDOWN_MS) return;
+
+    // Prune stale cooldown entries periodically so the Map doesn't accumulate dead entries
+    // over weeks of operation. Token count is bounded but a long-running bot can cycle through
+    // thousands of tokens.
+    this.protectingFillCount += 1;
+    if (this.protectingFillCount % 500 === 0) {
+      const cutoff = now - 300_000; // 5 minutes
+      for (const [tid, ts] of perVenue) {
+        if (ts < cutoff) perVenue.delete(tid);
+      }
+    }
 
     const signer = this.lastSigner;
     const signerAddress = this.lastSignerAddress;
@@ -883,9 +905,9 @@ export class ExecutionEngine {
 
     const release = await this.acquireProtectLock(venue);
     try {
-      // Dedupe marker set inside the lock+try so the outer finally always cleans it up,
-      // even if acquireProtectLock were to throw (which it doesn't in practice — defence in depth).
-      perVenue.add(tokenId);
+      // Mark in-flight NOW so concurrent WS fill events for the same token see the stamp and bail out
+      // at the cooldown gate above — no separate in-flight Set needed.
+      perVenue.set(tokenId, now);
       // Stamp the coordinator BEFORE doing work so the cycle (checking inside the same lock right before its
       // quote-place call) reliably observes that WS-protection fired during its window.
       this.lastWsProtectAt.set(venue, Date.now());
@@ -916,7 +938,8 @@ export class ExecutionEngine {
         venue,
         openOrders,
         'WS 推送实时成交，立即撤单后退场',
-        'fill-circuit-breaker.ws-triggered.cancel'
+        'fill-circuit-breaker.ws-triggered.cancel',
+        signerAddress
       );
 
       // Attach cached market to the synthetic position so cashExitMarkets can use it
@@ -952,7 +975,9 @@ export class ExecutionEngine {
       });
     } finally {
       release();
-      perVenue.delete(tokenId);
+      // Timestamp stays in the Map for PROTECT_ON_FILL_COOLDOWN_MS to suppress WS-replay
+      // floods. No delete — the entry naturally expires after cooldown (cooldown gate at top
+      // allows new protects once Date.now() - lastProtected >= cooldown).
     }
   }
 

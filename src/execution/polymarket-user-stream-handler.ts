@@ -38,6 +38,16 @@ export type PolymarketBotAddressGetter = () => string | undefined;
 
 export class PolymarketUserStreamHandler {
   private static readonly VENUE: VenueName = 'polymarket';
+  // Suppress duplicate fill.ws-ledgered events from WS replay floods. Polymarket user-channel
+  // WS can replay historical trade events after reconnect — the same fill_id may arrive hundreds
+  // of times. This Map dedupes at the fill_id level with a 60s TTL so real re-executions of the
+  // same trade (unlikely within 60s) are still recorded.
+  private static readonly PROCESSED_FILL_TTL_MS = 60_000;
+  // Prune stale dedupe entries every N calls so the Map doesn't grow without bound over
+  // weeks of continuous operation (Polymarket can push 100k+ trade events per day).
+  private static readonly PROCESSED_FILL_PRUNE_EVERY = 1000;
+  private processedFillIds = new Map<string, number>();
+  private processedFillCount = 0;
 
   constructor(
     private readonly store: StateStore,
@@ -61,6 +71,19 @@ export class PolymarketUserStreamHandler {
       this.recordUnparseable('trade', record);
       return;
     }
+    // Suppress WS replay floods: Polymarket user-channel WS may replay historical trade
+    // events after reconnect. The same fill_id arriving within PROCESSED_FILL_TTL_MS is
+    // a duplicate — skip recordWsFill (already INSERT OR IGNORE'd), skip recordEvent
+    // (would bloat events table), but DON'T re-invoke the protect hook (engine already
+    // handled this fill via the first occurrence).
+    const now = Date.now();
+    const lastProcessed = this.processedFillIds.get(fill.fillId);
+    if (lastProcessed !== undefined && now - lastProcessed < PolymarketUserStreamHandler.PROCESSED_FILL_TTL_MS) {
+      return;
+    }
+    this.processedFillIds.set(fill.fillId, now);
+    this.processedFillCount += 1;
+    this.maybePruneFillIds();
     try {
       this.store.recordWsFill({
         venue: PolymarketUserStreamHandler.VENUE,
@@ -125,6 +148,15 @@ export class PolymarketUserStreamHandler {
         message: 'WS 成交入库失败,退回 REST 兜底',
         details: { error: error instanceof Error ? error.message : String(error), fillId: fill.fillId }
       });
+    }
+  }
+
+  /** Periodically clean stale dedupe entries so the Map doesn't grow without bound. */
+  private maybePruneFillIds(): void {
+    if (this.processedFillCount % PolymarketUserStreamHandler.PROCESSED_FILL_PRUNE_EVERY !== 0) return;
+    const cutoff = Date.now() - 300_000; // 5 minutes
+    for (const [id, ts] of this.processedFillIds) {
+      if (ts < cutoff) this.processedFillIds.delete(id);
     }
   }
 

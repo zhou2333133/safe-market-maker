@@ -46,6 +46,12 @@ const GTD_REFRESH_BUFFER_SEC = 25;
 // can't drag the cycle past its 45s timeout — on timeout we fall back to the original "panic cancel" behaviour
 // so safety is never reduced versus the pre-fix code, only improved when the network responds in time.
 const NAKED_REST_REST_VERIFY_TIMEOUT_MS = 2000;
+// Managed-cancel retry: Predict REST cancel may return 200 without actually removing the order
+// from the on-chain book. Retry with verification via getOpenOrders so we never leave a
+// false-negative CANCELED in the local ledger. Fewer attempts + shorter backoff than kill-exit
+// because cancel is a simple REST call (not an on-chain tx with settlement delay).
+const MANAGED_CANCEL_MAX_ATTEMPTS = 3;
+const MANAGED_CANCEL_BACKOFF_MS = 800;
 
 interface CashMaintenanceStaleEntry {
   orderId: string;
@@ -508,40 +514,106 @@ export class CancelService {
     venue: VenueName,
     openOrders: OpenOrder[],
     reason: string,
-    eventType = 'risk.managed-cancel'
+    eventType = 'risk.managed-cancel',
+    signerAddress?: string
   ): Promise<CancelReplaceableOrdersResult> {
     const managedOpenOrders = this.managedOpenOrders(venue, openOrders);
     const ids = [...new Set(managedOpenOrders.map((order) => order.externalId).filter(Boolean))];
     if (ids.length === 0) return { openOrders, canceledIds: [] };
-    // Total stop-loss must NOT crash the venue loop. If the adapter raises, we record the failure, leave the local
-    // ledger as-is (so the next reconcile can correct it), and return a partial result so the engine can switch to
-    // exit-only mode for THIS venue without affecting the other one.
-    try {
-      await this.adapter.cancelOrders(ids);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    // Stop-loss cancel with retry + verification. Predict (and occasionally Polymarket) REST cancel
+    // may return 200 without actually removing the on-chain order. We retry up to N times and verify
+    // each round via getOpenOrders so we never mark an order CANCELED in local DB while it's still
+    // alive on the platform. If getOpenOrders itself fails or signerAddress is unavailable, we fall
+    // back to trusting the cancel API result — risk-stop must not be blocked by a flaky read API.
+    let remainingIds = [...ids];
+    const verifiedCanceled: string[] = [];
+    let lastCancelError: string | undefined;
+    for (let attempt = 0; attempt < MANAGED_CANCEL_MAX_ATTEMPTS && remainingIds.length > 0; attempt += 1) {
+      try {
+        await this.adapter.cancelOrders(remainingIds);
+      } catch (error) {
+        lastCancelError = error instanceof Error ? error.message : String(error);
+        if (attempt + 1 < MANAGED_CANCEL_MAX_ATTEMPTS && remainingIds.length > 0) {
+          await new Promise((resolve) => setTimeout(resolve, MANAGED_CANCEL_BACKOFF_MS));
+          continue;
+        }
+        // Exhausted retries — all cancel API calls failed
+        break;
+      }
+      // Verify: pull open orders to confirm which IDs actually disappeared
+      const canVerify = Boolean(signerAddress);
+      if (!canVerify) {
+        // No signer address — trust the cancel result (backward compatible)
+        this.store.markOrdersCanceled(venue, remainingIds);
+        verifiedCanceled.push(...remainingIds);
+        remainingIds = [];
+        break;
+      }
+      let remoteIdSet: Set<string>;
+      try {
+        const remoteOrders = await this.adapter.getOpenOrders(signerAddress!);
+        remoteIdSet = new Set(remoteOrders.map((o) => o.externalId).filter(Boolean));
+      } catch {
+        // getOpenOrders itself failed — trust the cancel and move on. Risk-stop must
+        // not deadlock on a flaky read API; the next reconcile cycle will correct any drift.
+        this.store.recordEvent({
+          venue,
+          severity: 'warn',
+          type: `${eventType}.verify-failed`,
+          message: `${reason}：撤单验证查询失败，信任撤单结果并标记已取消`,
+          details: { ids: remainingIds.length, reason, semantics: cancelSemantics(venue) }
+        });
+        this.store.markOrdersCanceled(venue, remainingIds);
+        verifiedCanceled.push(...remainingIds);
+        remainingIds = [];
+        break;
+      }
+      const stillAlive = remainingIds.filter((id) => remoteIdSet.has(id));
+      const gone = remainingIds.filter((id) => !remoteIdSet.has(id));
+      if (gone.length > 0) {
+        this.store.markOrdersCanceled(venue, gone);
+        verifiedCanceled.push(...gone);
+      }
+      if (stillAlive.length === 0) {
+        remainingIds = [];
+        break;
+      }
+      remainingIds = stillAlive;
+      if (attempt + 1 < MANAGED_CANCEL_MAX_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, MANAGED_CANCEL_BACKOFF_MS));
+      }
+    }
+    const hasRemaining = remainingIds.length > 0;
+    const allFailed = verifiedCanceled.length === 0 && hasRemaining;
+    if (allFailed) {
       this.store.recordEvent({
         venue,
         severity: 'error',
         type: `${eventType}.failed`,
-        message: `${reason}：撤单调用失败，本轮保留本地订单状态待下轮对账`,
-        details: { ids, reason, error: message, semantics: cancelSemantics(venue) }
+        message: `${reason}：撤单调用全部失败(${MANAGED_CANCEL_MAX_ATTEMPTS}次重试)，本轮保留本地订单状态待下轮对账`,
+        details: { ids: remainingIds, reason, error: lastCancelError ?? '未知', semantics: cancelSemantics(venue) }
       });
-      return { openOrders, canceledIds: [], failedIds: ids, cancelError: message };
+      return { openOrders, canceledIds: [], failedIds: ids, cancelError: lastCancelError ?? '撤单全部失败' };
     }
-    this.store.markOrdersCanceled(venue, ids);
     this.store.recordEvent({
       venue,
       severity: 'warn',
       type: eventType,
-      message: `${reason}：已撤 ${ids.length} 个机器人受管订单`,
+      message: `${reason}：已撤 ${verifiedCanceled.length} 个机器人受管订单` +
+        (hasRemaining ? `，${remainingIds.length} 个撤单未确认（${lastCancelError ?? '平台仍返回该订单'}）` : ''),
       details: {
-        ids,
+        verifiedCanceled,
+        ...(hasRemaining ? { remainingIds, lastCancelError } : {}),
         reason,
         semantics: cancelSemantics(venue)
       }
     });
-    return { openOrders: openOrders.filter((order) => !ids.includes(order.externalId)), canceledIds: ids };
+    const allCanceledIds = new Set(verifiedCanceled);
+    return {
+      openOrders: openOrders.filter((order) => !allCanceledIds.has(order.externalId)),
+      canceledIds: verifiedCanceled,
+      ...(hasRemaining ? { failedIds: remainingIds, cancelError: lastCancelError ?? '平台仍返回该订单' } : {})
+    };
   }
 
   private managedOpenOrders(venue: VenueName, openOrders: OpenOrder[]): OpenOrder[] {

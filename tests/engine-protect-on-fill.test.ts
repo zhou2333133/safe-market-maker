@@ -149,15 +149,26 @@ describe('ExecutionEngine.protectOnFill', () => {
     expect(adapter.getOpenOrders).toHaveBeenCalledTimes(2);
   });
 
-  it('clears the in-flight token after completion so a FUTURE fill on the same token can run again', async () => {
+  it('suppresses re-trigger within cooldown, allows re-trigger after cooldown expires', async () => {
     const { engine, adapter } = makeEngine();
     setSigner(engine, '0xABC');
+    let tick = 1_000_000;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => tick);
+
+    // First fill — should proceed normally
     await engine.protectOnFill('polymarket', 'tokA', 100, 0.32);
     expect(adapter.getOpenOrders).toHaveBeenCalledTimes(1);
 
-    // Second call AFTER the first completes — must run again, dedupe does not persist beyond the in-flight window.
+    // Second fill immediately — within 60s cooldown, must be suppressed
+    await engine.protectOnFill('polymarket', 'tokA', 100, 0.32);
+    expect(adapter.getOpenOrders).toHaveBeenCalledTimes(1); // still 1
+
+    // Advance time past the 60s cooldown — re-trigger now allowed
+    tick += 61_000;
     await engine.protectOnFill('polymarket', 'tokA', 100, 0.32);
     expect(adapter.getOpenOrders).toHaveBeenCalledTimes(2);
+
+    spy.mockRestore();
   });
 
   it('A-2 fires even when A-3 holds the SAME token in its book-dedupe (production 2026-06-26 bug regression)', async () => {
