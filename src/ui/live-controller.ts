@@ -548,7 +548,11 @@ export function isRetryableLiveLoopError(error: unknown): boolean {
     // signed messages fail the venue's freshness check). Subsequent calls succeed once the SDK re-syncs on the
     // next request — so this MUST be retryable, not a loop-killer. The Jun 25 04:45 incident froze POLY for
     // 2.5 hours because this string wasn't in the list.
-    'service not ready'
+    'service not ready',
+    // Same class of SDK state drift as "service not ready" — the CLOB SDK's internal order manager
+    // initialization can lag behind under heavy load, producing this message. Like its sibling, it
+    // self-heals on the next request after the SDK rebuilds its internal state.
+    'order manager not ready'
   ].some((needle) => lower.includes(needle));
 }
 
