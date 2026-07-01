@@ -32,6 +32,13 @@ const KILL_EXIT_BACKOFF_MS = 1500;
 // protectOnFill / cancelManagedOrders / exit retries on fills that were already handled.
 const PROTECT_ON_FILL_COOLDOWN_MS = 60_000;
 const wsDisconnectedSince = new Map<VenueName, number>();
+// Polymarket user-channel WS health gate: when the user channel is down, A-2 fill protection
+// is blind. Give the auto-reconnect 30s to succeed (matches USER_CHANNEL_STALE_MS and the
+// 500ms→32s exponential backoff), then pause new orders. If the channel stays down for 10min,
+// escalate to an error so the operator notices a persistent outage.
+const USER_WS_GRACE_MS = 30_000;
+const USER_WS_TIMEOUT_MS = 600_000;
+const userWsDisconnectedSince = new Map<VenueName, number>();
 
 export interface RunOnceOptions {
   venue: VenueName;
@@ -162,6 +169,7 @@ export class ExecutionEngine {
     // those pulls will surface any fills that arrived during the gap (REST is the belt-and-suspenders).
     const disconnectedAt = this.adapter.consumeUserChannelDisconnectFlag?.() ?? 0;
     if (disconnectedAt > 0) {
+      userWsDisconnectedSince.set(options.venue, disconnectedAt);
       this.store.recordEvent({
         venue: options.venue,
         severity: 'warn',
@@ -385,6 +393,35 @@ export class ExecutionEngine {
           details: { watchedMarkets: wsStats.watchedMarkets }
         });
         return {};
+      }
+      // Polymarket user-channel WS health gate. When the user channel is down, A-2 (WS fill protect)
+      // is blind — REST detection via maybeTripCashFillCircuitBreaker still fires, but at ~15s intervals
+      // instead of sub-second. Give the auto-reconnect a grace period (30s, covering the 500ms→32s
+      // exponential backoff), then pause new orders. Mirror of the Predict market-channel gate above.
+      if (options.venue === 'polymarket') {
+        const adapter = this.adapter as unknown as { isUserWsHealthy?(): boolean };
+        const userWsHealthy = adapter.isUserWsHealthy?.();
+        if (userWsHealthy === false) {
+          const dcTs = userWsDisconnectedSince.get(options.venue) ?? Date.now();
+          const elapsed = Date.now() - dcTs;
+          if (elapsed > USER_WS_TIMEOUT_MS) {
+            throw new Error(`Polymarket user WS reconnection timed out after ${Math.round(elapsed / 1000)}s`);
+          }
+          if (elapsed >= USER_WS_GRACE_MS) {
+            this.stage(options.venue, 'idle', `WS user 通道断开超过${Math.round(USER_WS_GRACE_MS / 1000)}s，A-2 成交保护缺失，暂停新增挂单`);
+            this.recorder.event({
+              venue: options.venue,
+              severity: 'warn',
+              type: 'ws.user-channel.pause-orders',
+              message: `WS user 通道断开超过${Math.round(USER_WS_GRACE_MS / 1000)}s，A-2 成交保护缺失，暂停新增挂单`,
+              details: { disconnectedAt: new Date(dcTs).toISOString(), elapsedMs: elapsed }
+            });
+            return {};
+          }
+          this.stage(options.venue, 'syncing-markets', `WS user 通道重连中(已断开${Math.round(elapsed / 1000)}s，宽限期${Math.round((USER_WS_GRACE_MS - elapsed) / 1000)}s)，REST 兜底保护中`);
+        } else if (userWsHealthy === true) {
+          userWsDisconnectedSince.delete(options.venue);
+        }
       }
       this.stage(options.venue, 'syncing-markets', '同步候选市场和订单簿');
       const marketSnapshot = await this.marketDataSync.sync(options.venue, { openOrders, positions });

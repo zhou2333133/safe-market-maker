@@ -389,6 +389,12 @@ export class PolymarketVenue implements VenueAdapter {
     return this.wsClient().consumeUserDisconnectedFlag();
   }
 
+  /** True when the user-channel WS is connected, subscribed, and has recent activity (<30s). Used by the
+   *  engine's WS health gate to pause new orders when A-2 fill protection is blind. */
+  isUserWsHealthy(): boolean {
+    return this.wsClient().userChannelState().healthy;
+  }
+
   private wsClient(): PolymarketWsClient {
     const url = this.config.venues.polymarket.wsUrl;
     let client = PolymarketVenue.wsClients.get(url);
