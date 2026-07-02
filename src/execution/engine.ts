@@ -243,8 +243,19 @@ export class ExecutionEngine {
         'risk.daily-loss-stop.cancel-managed',
         signerAddress
       );
+      // Re-sync positions after the cancel so killExit acts on the freshest data possible.
+      // The positions variable was populated at step 6 (syncPositions above); a fill can land
+      // between that step and this stop block (observed 2026-07-02: fill at 07:57:43, stop at
+      // 07:57:47 with stale empty positions). A fresh read here closes that gap.
+      let positionsFresh = positions;
+      try {
+        const resync = await this.accountSync.syncPositions({ venue: options.venue, signerAddress });
+        if (resync.ok) positionsFresh = resync.positions;
+      } catch {
+        // Keep original positions if the re-sync fails — stale data beats no data.
+      }
       let killExit: CashFillExitResult | undefined;
-      let exitPositions = positions.filter((position) => position.venue === options.venue && isMaterialCashPosition(this.config, position));
+      let exitPositions = positionsFresh.filter((position) => position.venue === options.venue && isMaterialCashPosition(this.config, position));
       if (exitPositions.length > 0) {
         for (let attempt = 0; attempt < KILL_EXIT_MAX_ATTEMPTS && exitPositions.length > 0; attempt += 1) {
           const killMarkets = await this.cashExitMarkets(options.venue, exitPositions);
