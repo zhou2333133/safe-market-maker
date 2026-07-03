@@ -832,7 +832,11 @@ function cashMaintenanceBookUnavailableDecision(
 }
 
 function cashMaintenanceStaleGraceMs(config: AppConfig): number {
-  const base = Math.max(CASH_PROTECTED_ORDER_STALE_GRACE_MS, config.risk.staleBookMs * 5);
+  // F6-B: Reduced from staleBookMs×5 to ×2 to shorten the stale-book blind window.
+  // Polymarket staleBookMs=8000 → old grace=40000ms(40s) + 2 strikes ≈ 70s before cancel.
+  // New grace=16000ms(16s) + 2 strikes ≈ 46s. Still not instant but significantly narrows
+  // the unprotected window (2026-07-03 Polymarket: order eaten in 26s, old config took 70s+).
+  const base = Math.max(CASH_PROTECTED_ORDER_STALE_GRACE_MS, config.risk.staleBookMs * 2);
   const predictOverride = config.strategy.predictCashBuyStaleGraceMs ?? 0;
   return predictOverride > 0 ? Math.max(base, predictOverride) : base;
 }

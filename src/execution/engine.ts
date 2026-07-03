@@ -1191,7 +1191,27 @@ export class ExecutionEngine {
       const reasons: Array<{ orderId: string; reason: string }> = [];
       for (const order of managed) {
         const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
-        if (!retreat) continue;
+        if (!retreat) {
+          // F6-A: shouldRetreatThinFront returns null for stale books — but stale book means
+          // we CAN'T verify the order is safe. If the order has been resting long enough that
+          // a WS push should have arrived (>30s), cancel it rather than letting it sit blind.
+          // Polymarket 2026-07-03: token rested 26s with zero WS pushes, A-3 never triggered
+          // because no push arrived. When a push DOES arrive for a different token, this
+          // callback runs — and checking stale book here catches the blind ones.
+          if (book) {
+            const bookAgeMs = Date.now() - book.receivedAt;
+            const orderAgeMs = order.placedAt ? Date.now() - order.placedAt : 0;
+            const staleMs = this.config.risk.staleBookMs;
+            if (bookAgeMs > staleMs && orderAgeMs > 30_000) {
+              toCancel.push(order.externalId);
+              reasons.push({
+                orderId: order.externalId,
+                reason: `盘口过期 ${Math.round(bookAgeMs / 1000)}s 且订单已挂 ${Math.round(orderAgeMs / 1000)}s，WS 推送盲区内主动撤退`
+              });
+            }
+          }
+          continue;
+        }
         toCancel.push(order.externalId);
         const parts: string[] = [];
         if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
