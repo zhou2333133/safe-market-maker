@@ -5,7 +5,7 @@ import { bestBidAsk } from '../venues/normalize.js';
 import { completeSetInventoryGroups, expectedOutcomeCount, hasCompleteOutcomeSet, isCashMultiMarketEntry, isPairedEntryMode, marketGroupKey, pairedPositionGroups } from './paired-inventory.js';
 import { effectiveQuoteSide } from './strategy-engine.js';
 import { createRewardOptimizer } from './rewards/factory.js';
-import { formatUsd, isWithinRewardBand, rewardLevel, rewardQuoteProtection, rewardQuoteProtectionDiagnostic, rewardTargetShares, shouldEnforceRewardMinimum, shouldProtectRewardQuote } from './rewards/common.js';
+import { computeCompetitionBand, formatUsd, isWithinRewardBand, rewardLevel, rewardQuoteProtection, rewardQuoteProtectionDiagnostic, rewardTargetShares, shouldEnforceRewardMinimum, shouldProtectRewardQuote } from './rewards/common.js';
 import { polymarketQmin, polymarketRewardCompetition } from './rewards/polymarket-competition.js';
 import { polymarketMidVolatilityPct, recordPolymarketMid } from './rewards/polymarket-volatility.js';
 
@@ -661,11 +661,15 @@ function routeMetrics(
         polymarketMid: polymarketCompetition.mid
       }
     : hasCompetitionDepth
-      ? competitionMetrics({
-          ppPerHour,
-          rewardBandDepthUsd: bandDepthUsd,
-          targetOrderUsd
-        })
+      ? (() => {
+          const m = computeCompetitionBand(bandDepthUsd, targetOrderUsd, ppPerHour);
+          return {
+            expectedPpPerHour: Number(m.expectedPerHour.toFixed(4)),
+            ppPerThousandUsd: Number(m.ppPerThousandUsd.toFixed(4)),
+            targetSharePct: Number(m.sharePct.toFixed(4)),
+            competitionBand: m.competitionBand
+          };
+        })()
       : { competitionBand: 'unknown' as const };
   return {
     ppPerHour,
@@ -1303,26 +1307,6 @@ function topDepthUsd(book: Orderbook, sides: OrderSide[]): number {
   if (sides.includes('BUY')) total += book.bids.slice(0, 3).reduce((sum, level) => sum + level.price * level.size, 0);
   if (sides.includes('SELL')) total += book.asks.slice(0, 3).reduce((sum, level) => sum + level.price * level.size, 0);
   return Number(total.toFixed(4));
-}
-
-function competitionMetrics(input: {
-  ppPerHour: number;
-  rewardBandDepthUsd: number;
-  targetOrderUsd: number;
-}): Pick<MarketRouteMetrics, 'expectedPpPerHour' | 'ppPerThousandUsd' | 'targetSharePct' | 'competitionBand'> {
-  if (input.rewardBandDepthUsd < 0 || input.targetOrderUsd <= 0) {
-    return { competitionBand: 'unknown' };
-  }
-  const denominator = input.rewardBandDepthUsd + input.targetOrderUsd;
-  const targetSharePct = Number(((input.targetOrderUsd / denominator) * 100).toFixed(4));
-  const expectedPpPerHour = Number((input.ppPerHour * input.targetOrderUsd / denominator).toFixed(4));
-  const ppPerThousandUsd = Number(((expectedPpPerHour / input.targetOrderUsd) * 1000).toFixed(4));
-  const competitionBand = input.rewardBandDepthUsd < input.targetOrderUsd * 3
-    ? 'thin'
-    : input.rewardBandDepthUsd > input.targetOrderUsd * 250
-      ? 'crowded'
-      : 'balanced';
-  return { expectedPpPerHour, ppPerThousandUsd, targetSharePct, competitionBand };
 }
 
 function compareRouteCandidates(a: MarketRouteCandidate, b: MarketRouteCandidate): number {

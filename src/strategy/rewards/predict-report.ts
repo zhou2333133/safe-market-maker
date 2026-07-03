@@ -7,7 +7,7 @@
 
 import type { AppConfig } from '../../config/schema.js';
 import type { Market, OpenOrder, Orderbook } from '../../domain/types.js';
-import { isWithinRewardBand } from './common.js';
+import { computeCompetitionBand, isWithinRewardBand } from './common.js';
 
 // ---------------------------------------------------------------------------
 // 公共类型
@@ -64,28 +64,6 @@ export interface PredictReportSummary {
 // ---------------------------------------------------------------------------
 // 竞争指标（复用 market-router 中相同的公式，但独立不引入耦合）
 // ---------------------------------------------------------------------------
-
-function competitionMetrics(ppPerHour: number, competitionUsd: number, ownNotionalUsd: number): {
-  expectedPtsPerHour: number;
-  ppPerThousandUsd: number;
-  sharePct: number;
-  competitionBand: 'unknown' | 'thin' | 'balanced' | 'crowded';
-} {
-  if (competitionUsd < 0 || ownNotionalUsd <= 0) {
-    return { expectedPtsPerHour: 0, ppPerThousandUsd: 0, sharePct: 0, competitionBand: 'unknown' };
-  }
-  const denominator = competitionUsd + ownNotionalUsd;
-  const sharePct = Number(((ownNotionalUsd / denominator) * 100).toFixed(2));
-  const expectedPtsPerHour = Number(((ppPerHour * ownNotionalUsd) / denominator).toFixed(4));
-  const ppPerThousandUsd = Number(((expectedPtsPerHour / ownNotionalUsd) * 1000).toFixed(4));
-
-  let competitionBand: 'thin' | 'balanced' | 'crowded' | 'unknown' = 'unknown';
-  if (competitionUsd < ownNotionalUsd * 3) competitionBand = 'thin';
-  else if (competitionUsd > ownNotionalUsd * 250) competitionBand = 'crowded';
-  else competitionBand = 'balanced';
-
-  return { expectedPtsPerHour, ppPerThousandUsd, sharePct, competitionBand };
-}
 
 // ---------------------------------------------------------------------------
 // 奖励带内竞争资金（不包含自己）
@@ -161,10 +139,10 @@ function buildOrderReport(
     competitionUsd = competitionInBandUsd(book, order.side, order.price, maxSpreadCents, order.size);
     depthLevel = depthLabel(order.side, order.price, book);
 
-    const metrics = competitionMetrics(ppPerHour, competitionUsd, notionalUsd);
-    sharePct = metrics.sharePct;
-    expectedPtsPerHour = metrics.expectedPtsPerHour;
-    ppPerThousandUsd = metrics.ppPerThousandUsd;
+    const metrics = computeCompetitionBand(competitionUsd, notionalUsd, ppPerHour);
+    sharePct = Number(metrics.sharePct.toFixed(2));
+    expectedPtsPerHour = Number(metrics.expectedPerHour.toFixed(4));
+    ppPerThousandUsd = Number(metrics.ppPerThousandUsd.toFixed(4));
     competitionBand = metrics.competitionBand;
   }
 

@@ -383,6 +383,32 @@ export function frontProtectionDepthUsd(book: Orderbook, side: OrderSide, price:
   return Number(levels.reduce((sum, level) => sum + level.price * level.size, 0).toFixed(4));
 }
 
+/**
+ * Shared competition-band computation for route scoring (market-router.ts) and reward reporting
+ * (predict-report.ts). Returns raw numeric values — callers format precision (toFixed) and map
+ * field names to their own interfaces. The thin/crowded thresholds (3x / 250x) are unified here
+ * so they can never drift between the two consumers.
+ */
+export function computeCompetitionBand(
+  competitionUsd: number,
+  ownNotionalUsd: number,
+  ppPerHour: number
+): { sharePct: number; expectedPerHour: number; ppPerThousandUsd: number; competitionBand: 'unknown' | 'thin' | 'balanced' | 'crowded' } {
+  if (competitionUsd < 0 || ownNotionalUsd <= 0) {
+    return { sharePct: 0, expectedPerHour: 0, ppPerThousandUsd: 0, competitionBand: 'unknown' };
+  }
+  const denominator = competitionUsd + ownNotionalUsd;
+  const sharePct = (ownNotionalUsd / denominator) * 100;
+  const expectedPerHour = (ppPerHour * ownNotionalUsd) / denominator;
+  const ppPerThousandUsd = (expectedPerHour / ownNotionalUsd) * 1000;
+  const competitionBand = competitionUsd < ownNotionalUsd * 3
+    ? 'thin'
+    : competitionUsd > ownNotionalUsd * 250
+      ? 'crowded'
+      : 'balanced';
+  return { sharePct, expectedPerHour, ppPerThousandUsd, competitionBand };
+}
+
 export function rewardQuoteProtection(config: AppConfig, side: OrderSide, price: number, book: Orderbook, market?: Market): { ok: boolean; reason: string; depthUsd: number; minDepthUsd: number; supportGapCents?: number } {
   const bbo = bestBidAsk(book);
   const minDepthUsd = minQuoteProtectionUsd(config, side, price, market);

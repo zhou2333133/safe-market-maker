@@ -13,7 +13,7 @@ import { OrderReconciler } from './order-reconciler.js';
 import { fullCashAuditBasketFromValue, RouteService } from './route-service.js';
 import { LiquidationService } from './liquidation-service.js';
 import { MarketDataSyncService } from './market-data-sync.js';
-import { CancelService, shouldRetreatThinFront } from './cancel-service.js';
+import { CancelService, formatRetreatReasons, shouldRetreatThinFront } from './cancel-service.js';
 import { CashFillExitService, isMaterialCashPosition, type CashFillExitResult } from './cash-fill-exit-service.js';
 import { ExecutionRecorder } from './event-recorder.js';
 import { QuoteCycleService } from './quote-cycle-service.js';
@@ -1249,19 +1249,7 @@ export class ExecutionEngine {
           continue;
         }
         toCancel.push(order.externalId);
-        const parts: string[] = [];
-        if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
-          parts.push(`前方深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
-        }
-        if (retreat.supportShortfall) {
-          const s = retreat.supportShortfall;
-          parts.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)} (${s.windowCents}¢ 窗口内) < 需要 $${s.requiredUsd}`);
-        }
-        if (retreat.levelFailed) {
-          const lf = retreat.levelFailed;
-          parts.push(`前方仅剩 ${lf.frontLevels} 档(需 ${lf.minLevels} 档)，队列位置暴露`);
-        }
-        reasons.push({ orderId: order.externalId, reason: parts.join(' + ') });
+        reasons.push({ orderId: order.externalId, reason: formatRetreatReasons(retreat) });
       }
       if (toCancel.length === 0) return;
 

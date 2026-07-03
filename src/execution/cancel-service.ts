@@ -160,15 +160,7 @@ export class CancelService {
     if (!retreat) {
       return { keep: true, verified: true, reason: `REST 验证盘口仍健康(book age ${Date.now() - freshBook.receivedAt}ms),保留挂单` };
     }
-    const reasons: string[] = [];
-    if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
-      reasons.push(`前方保护深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
-    }
-    if (retreat.supportShortfall) {
-      const s = retreat.supportShortfall;
-      reasons.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)}(${s.windowCents}¢ 窗口内)< $${s.requiredUsd}`);
-    }
-    return { keep: false, verified: true, reason: `REST 验证后确认不安全:${reasons.join(' + ')},撤单避免被吃` };
+    return { keep: false, verified: true, reason: `REST 验证后确认不安全:${formatRetreatReasons(retreat)},撤单避免被吃` };
   }
 
   async cancelReplaceableOrders(
@@ -323,23 +315,11 @@ export class CancelService {
         cancelIds.add(order.externalId);
         // Reason text reflects WHICH protection eroded — front cushion, rear support, or both — so post-hoc forensic
         // review can tell whether the eat-vector was "front pulled" vs "support yanked behind me".
-        const reasons: string[] = [];
-        if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
-          reasons.push(`前方保护深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
-        }
-        if (retreat.supportShortfall) {
-          const s = retreat.supportShortfall;
-          reasons.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)}(${s.windowCents}¢ 窗口内)< $${s.requiredUsd}`);
-        }
-        if (retreat.levelFailed) {
-          const lf = retreat.levelFailed;
-          reasons.push(`前方仅剩 ${lf.frontLevels} 档(需 ${lf.minLevels} 档)，队列位置暴露`);
-        }
         cancelReasons.push({
           orderId: order.externalId,
           tokenId: order.tokenId,
           side: order.side,
-          reason: `${reasons.join(' + ')}，快撤避免被吃`
+          reason: `${formatRetreatReasons(retreat)}，快撤避免被吃`
         });
         continue;
       }
@@ -780,6 +760,29 @@ export function shouldRetreatThinFront(
   const levelFailed = frontLevels < minLevels;
   if (!frontFailed && !supportShortfall && !levelFailed) return null;
   return { frontDepthUsd, floorUsd, ...(supportShortfall ? { supportShortfall } : {}), ...(levelFailed ? { levelFailed: { frontLevels, minLevels } } : {}) };
+}
+
+/**
+ * Format the human-readable reason string for a shouldRetreatThinFront positive result.
+ * Shared by cancelReplaceableOrders, verifyNakedOrderViaRest, and protectOnBookUpdate (engine.ts)
+ * so the three call sites never drift in wording. The supportShortfall segment MUST contain the
+ * substring "后方退出流动性" — exitLiquidityCooldown (cancel-service.ts:1017) matches on it to
+ * trigger per-token cooldown strikes.
+ */
+export function formatRetreatReasons(retreat: NonNullable<ReturnType<typeof shouldRetreatThinFront>>): string {
+  const parts: string[] = [];
+  if (retreat.floorUsd > 0 && retreat.frontDepthUsd + 1e-9 < retreat.floorUsd) {
+    parts.push(`前方保护深度跌至 $${retreat.frontDepthUsd.toFixed(0)} < 撤退线 $${retreat.floorUsd.toFixed(0)}`);
+  }
+  if (retreat.supportShortfall) {
+    const s = retreat.supportShortfall;
+    parts.push(`后方退出流动性 $${s.exitDepthUsd.toFixed(0)} (${s.windowCents}¢ 窗口内) < 需要 $${s.requiredUsd}`);
+  }
+  if (retreat.levelFailed) {
+    const lf = retreat.levelFailed;
+    parts.push(`前方仅剩 ${lf.frontLevels} 档(需 ${lf.minLevels} 档)，队列位置暴露`);
+  }
+  return parts.join(' + ');
 }
 
 function cashMaintenanceBookUnavailableDecision(
