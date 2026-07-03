@@ -34,6 +34,7 @@ export interface CancelReplaceableOrdersOptions {
 const CASH_EMPTY_ROUTE_PRESERVE_MIN_MARKETS = 2;
 const CASH_PROTECTED_ORDER_STALE_STRIKES_TO_CANCEL = 2;
 const CASH_PROTECTED_ORDER_STALE_GRACE_MS = 15_000;
+const MAX_CONSECUTIVE_DEFER_STRIKES = 3;
 // Fast-tick replace debounce: a 1-tick target drift must be re-proposed (same target price) on a second tick inside
 // this window before the resting order is cancel/replaced — one-tick book flicker at the fast cadence would otherwise
 // churn the order and forfeit its queue position. Drifts of >= 2 ticks are treated as real moves and replace at once.
@@ -65,6 +66,7 @@ interface CashMaintenanceStaleEntry {
 
 export class CancelService {
   private readonly strategy: StrategyEngine;
+  private readonly deferStrikes: Map<string, number>;
 
   constructor(
     private readonly config: AppConfig,
@@ -72,6 +74,7 @@ export class CancelService {
     private readonly store: StateStore
   ) {
     this.strategy = new StrategyEngine(config);
+    this.deferStrikes = new Map();
   }
 
   async cancelGuardedOrders(
@@ -206,6 +209,14 @@ export class CancelService {
     const nextMaintenanceStaleState = new Map<string, CashMaintenanceStaleEntry>();
     const replaceConfirmState = readFastReplaceConfirmState(this.store.getCheckpoint(fastReplaceConfirmCheckpointKey(venue))?.value);
     const nextReplaceConfirmState = new Map<string, FastReplaceConfirmEntry>();
+    // Per-token defer counter persisted in checkpoint — when a token gets deferred too many consecutive times,
+    // give up and cancel. This prevents replace-deferred storms from accumulating indefinitely.
+    const deferStrikesKey = `defer-strikes.${venue}`;
+    const savedDeferStrikes = readDeferStrikes(this.store.getCheckpoint(deferStrikesKey)?.value);
+    for (const [tokenId, strikes] of savedDeferStrikes) {
+      this.deferStrikes.set(tokenId, strikes);
+    }
+    const nextDeferStrikes = new Map(this.deferStrikes);
     const now = Date.now();
 
     // Pre-pass: collect all orders requiring naked-rest REST verification and run them CONCURRENTLY.
@@ -471,6 +482,41 @@ export class CancelService {
       }
     }
 
+    // Per-token defer strikes: escalate deferred orders to cancel when the same token has been
+    // deferred too many consecutive times. This prevents replace-deferred storms from accumulating
+    // over hundreds of cycles without ever resolving.
+    for (const d of deferredReasons) {
+      const strikes = (nextDeferStrikes.get(d.tokenId) ?? 0) + 1;
+      nextDeferStrikes.set(d.tokenId, strikes);
+    }
+    const exceedLimit = new Set<string>();
+    for (const d of deferredReasons) {
+      const strikes = nextDeferStrikes.get(d.tokenId) ?? 0;
+      if (strikes >= MAX_CONSECUTIVE_DEFER_STRIKES) {
+        exceedLimit.add(d.orderId);
+        cancelIds.add(d.orderId);
+        cancelReasons.push({
+          orderId: d.orderId,
+          tokenId: d.tokenId,
+          side: d.side,
+          reason: `${d.reason}（连续${strikes}次延迟，超出${MAX_CONSECUTIVE_DEFER_STRIKES}次上限改为撤单）`
+        });
+      }
+    }
+    // Reset the counter only for tokens whose orders were actually cancelled (not deferred)
+    for (const tokenId of new Set([...cancelIds].map(id => managedOpenOrders.find(o => o.externalId === id)?.tokenId).filter(Boolean) as string[])) {
+      nextDeferStrikes.delete(tokenId);
+    }
+    if (exceedLimit.size > 0) {
+      const filtered = deferredReasons.filter(d => !exceedLimit.has(d.orderId));
+      deferredReasons.length = 0;
+      deferredReasons.push(...filtered);
+    }
+    this.store.checkpoint(deferStrikesKey, {
+      updatedAt: new Date(now).toISOString(),
+      maxStrikes: MAX_CONSECUTIVE_DEFER_STRIKES,
+      entries: Object.fromEntries(nextDeferStrikes.entries())
+    });
     const ids = [...cancelIds].filter(Boolean);
     if (deferredReasons.length > 0) {
       this.store.recordEvent({
@@ -1009,4 +1055,15 @@ async function withCancelServiceTimeout<T>(promise: Promise<T>, ms: number, labe
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function readDeferStrikes(checkpointValue: unknown): Map<string, number> {
+  const result = new Map<string, number>();
+  if (!checkpointValue || typeof checkpointValue !== 'object') return result;
+  const entries = (checkpointValue as Record<string, unknown>).entries;
+  if (!entries || typeof entries !== 'object') return result;
+  for (const [tokenId, strikes] of Object.entries(entries as Record<string, unknown>)) {
+    if (typeof strikes === 'number') result.set(tokenId, strikes);
+  }
+  return result;
 }

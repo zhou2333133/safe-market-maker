@@ -5,7 +5,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { ensureDataDirs, loadConfig } from '../config/load.js';
 import { appCss, appHtml, appScript } from './assets.js';
-import { liveStatus, type LiveLoops } from './live-loop-state.js';
+import { liveStatus, markLoopError, type LiveLoops } from './live-loop-state.js';
 import { UiError } from './errors.js';
 import { applyRecommendations, balances, grantPolymarketApprovals, orderbook, recommendations, routeAudit, startupFacts, predictReport, status, statusSummary, updateTradingConfig } from './query-controller.js';
 import { liveStart, liveStop, liveStopAndCancel, restoreLiveLoops } from './live-controller.js';
@@ -173,7 +173,7 @@ export async function startUiServer(configPath: string, options: UiServerOptions
   const url = `http://${host}:${resolvedPort}`;
   singleton?.update({ host, port: resolvedPort, url });
   restoreLiveLoops(loaded.configPath, liveLoops);
-  const watchdog = startLoopStaleWatchdog(loaded.dataDir);
+  const watchdog = startLoopStaleWatchdog(loaded.dataDir, liveLoops);
   const configWatcher = startConfigChangeWatcher(loaded.configPath, loaded.dataDir);
   return {
     url,
@@ -246,7 +246,7 @@ function startConfigChangeWatcher(configPath: string, dataDir: string): { close(
   } catch { return undefined; }
 }
 
-function startLoopStaleWatchdog(dataDir: string): NodeJS.Timeout {
+function startLoopStaleWatchdog(dataDir: string, liveLoops: LiveLoops): NodeJS.Timeout {
   const LOOP_STALE_THRESHOLD_MS = 30 * 60 * 1000;
   const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
   const lastAlertedAt = new Map<string, number>();
@@ -285,6 +285,20 @@ function startLoopStaleWatchdog(dataDir: string): NodeJS.Timeout {
             message: `${venue} 主循环已 ${Math.round(stalenessMs / 60000)} 分钟无 cycle（阈值 ${LOOP_STALE_THRESHOLD_MS / 60000} 分钟），可能进入 error 态或卡死`,
             details: { lastCycleAt: lastCycle, loopStartedAt: loopStarted, stalenessMs, thresholdMs: LOOP_STALE_THRESHOLD_MS }
           });
+          // When the loop is stale for > 1h, attempt auto-recovery: mark the loop state as error so the UI
+          // reflects reality, and let any existing inter-cycle stall watchdog / restart logic take over.
+          if (stalenessMs > 60 * 60 * 1000) {
+            const loop = liveLoops.get(venue);
+            if (loop && loop.status === 'running') {
+              markLoopError(loop, new Error(`stale-detected: ${Math.round(stalenessMs / 60000)} min without cycle`));
+              store.recordEvent({
+                venue,
+                severity: 'error',
+                type: 'loop-stale-auto-recovery',
+                message: `${venue} 循环超过 60 分钟无响应，已自动标记为 error 状态`
+              });
+            }
+          }
         }
       } finally {
         store.close();

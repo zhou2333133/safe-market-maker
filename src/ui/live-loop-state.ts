@@ -17,6 +17,8 @@ export interface LiveLoopState {
   cycles: number;
   /** Epoch ms of the last FULL discovery cycle (fast quote-refresh runs lighter ticks in between). */
   lastFullCycleAt?: number;
+  /** Epoch ms when the most recent cycle completed; used by the inter-cycle deadlock watchdog. */
+  lastCycleCompletedAt?: number;
   stopRequested: boolean;
   timer?: NodeJS.Timeout;
   wake?: () => void;
@@ -90,6 +92,7 @@ export function completeLoopStop(loop: LiveLoopState, now: Date = new Date()): v
 export function markLoopCycleCompleted(loop: LiveLoopState, now: Date = new Date()): void {
   loop.cycles += 1;
   loop.lastCycleAt = now.toISOString();
+  loop.lastCycleCompletedAt = now.getTime();
   delete loop.lastError;
   delete loop.retryCount;
   delete loop.retryAt;

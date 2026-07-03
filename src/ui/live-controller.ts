@@ -260,6 +260,28 @@ async function runLiveLoop(
 ): Promise<void> {
   try {
     while (!loop.stopRequested) {
+      // Inter-cycle stall watchdog: if the last cycle completed normally but the next iteration
+      // has not started within INTER_CYCLE_STALL_MS, the transition between cycles is deadlocked
+      // (e.g. a non-retryable error in createVenueForUi / usingStore was silently swallowed).
+      // Unlike withLiveCycleTimeout (which only guards a single runOnce), this catches stalls
+      // that happen AFTER a cycle completes but BEFORE the next one begins.
+      if (loop.lastCycleCompletedAt && (Date.now() - loop.lastCycleCompletedAt) > INTER_CYCLE_STALL_MS) {
+        liveAdapterCache.delete(venue);
+        const message = `${venue} 循环间过渡卡死超过 ${INTER_CYCLE_STALL_MS / 1000} 秒,清除适配器缓存并重试`;
+        logger.error(message);
+        try {
+          const reportStore = usingStore(loadConfig(configPath).dataDir);
+          try {
+            reportStore.recordEvent({ venue, severity: 'error', type: 'ui.live.inter-cycle-stalled', message });
+          } finally {
+            reportStore.close();
+          }
+        } catch {
+          // best-effort — the event loop / store itself may be the bottleneck
+        }
+        loop.lastCycleCompletedAt = undefined;
+        continue; // restart the iteration with a fresh adapter
+      }
       try {
         const loaded = loadConfig(configPath);
         // Each venue's cycle runs on its own independent risk + strategy (Predict base unchanged; Polymarket block).
@@ -407,7 +429,14 @@ async function runLiveLoop(
         // connection or credential went bad (e.g. a CLOB TLS/createApiKey failure).
         liveAdapterCache.delete(venue);
         if (!isRetryableLiveLoopError(error)) {
-          recordLoopError(configPath, venue, markLoopError(loop, error));
+          // Log to console first so the reason is visible even if the store / event recording is broken
+          const errorMessage = publicErrorMessage(error);
+          logger.error(`[${venue}] 循环因不可重试错误退出: ${errorMessage}`, error instanceof Error ? error.stack : undefined);
+          try {
+            recordLoopError(configPath, venue, markLoopError(loop, error));
+          } catch {
+            // recordLoopError itself may fail if the store is unavailable — the console log above is the fallback
+          }
           return;
         }
         const retryCount = (loop.retryCount ?? 0) + 1;
@@ -429,6 +458,7 @@ async function runLiveLoop(
 const FAST_RETREAT_INTERVAL_MS = 3000;
 const FAST_RETREAT_MAX_CANCELS = 5;
 const FAST_RETREAT_DEDUPE_MS = 10000;
+const INTER_CYCLE_STALL_MS = 30_000;
 
 async function waitForNextCycleInterleaved(
   loop: LiveLoopState,
