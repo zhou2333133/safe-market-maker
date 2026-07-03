@@ -674,8 +674,10 @@ export function shouldRetreatThinFront(
   if (isStaleBook(config, book)) return null;
   // (a) Front-cushion retreat. Per-venue knob (modules independent): POLY uses polymarketRetreatFrontDepthUsd,
   // Predict uses predictFrontDepthUsd (no separate retreat knob — match placement floor = no hysteresis).
+  // When polymarketRetreatFrontDepthUsd is 0 (unset), default to polymarketFrontDepthUsd so changing the
+  // protection depth in the UI automatically syncs the retreat threshold without a second manual step.
   const floorUsd = venue === 'polymarket'
-    ? (config.strategy.polymarketRetreatFrontDepthUsd ?? 0)
+    ? (config.strategy.polymarketRetreatFrontDepthUsd || config.strategy.polymarketFrontDepthUsd)
     : venue === 'predict'
       ? (config.strategy.predictFrontDepthUsd ?? 0)
       : 0;
