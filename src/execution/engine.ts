@@ -1,5 +1,5 @@
 import type { AppConfig } from '../config/schema.js';
-import type { AccountRiskDecision, AccountRiskSnapshot, Market, NativeGasBalance, OpenOrder, Orderbook, Position, VenueName } from '../domain/types.js';
+import type { AccountRiskDecision, AccountRiskSnapshot, Market, NativeGasBalance, OpenOrder, Orderbook, OrderIntent, Position, VenueName } from '../domain/types.js';
 import type { SignerProvider } from '../secrets/signer.js';
 import type { StateStore } from '../store/sqlite.js';
 import { rejectReason } from '../risk/reject-reasons.js';
@@ -107,6 +107,12 @@ export class ExecutionEngine {
   private protectingFillCount = 0;
   // Per-(venue, tokenId) dedupe for A-3 (WS book update → retreat). Independent of fill dedupe.
   private readonly protectingBookTokens = new Map<VenueName, Set<string>>();
+  // Token retreat cooldown: when A-3 (WS book retreat) cancels a token's orders, record the timestamp
+  // so the next cycle skips re-placing on that token for RETREAT_COOLDOWN_MS. Prevents re-entering a
+  // position that was just evacuated because the book was thinning (2026-07-03 Predict incident: token
+  // retreated at 05:50:55, re-placed at 05:52:13, eaten 43s later).
+  private readonly retreatedAt = new Map<VenueName, Map<string, number>>();
+  private static readonly RETREAT_COOLDOWN_MS = 120_000;
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
   // > cycleStartedAt, WS already cleared a position this cycle → skip placement to avoid re-pinning the token.
   private readonly lastWsProtectAt = new Map<VenueName, number>();
@@ -531,6 +537,42 @@ export class ExecutionEngine {
       });
       return {};
     }
+    // === Replace-cycle systemic book-health gate (Predict 2026-07-03 incident) ===
+    // When cancelReplaceableOrders deferred too many tokens (books unavailable) OR naked REST
+    // verifications failed on multiple tokens (RPC sick), pause new-order placement for this
+    // cycle. Without this gate a "lucky" token whose book happened to be cached gets re-placed
+    // during a venue-wide RPC outage, rests unprotected, and is eaten before the next WS retreat
+    // can fire — as seen on Predict token 1027575… where a BUY was eaten 43s after placement
+    // while the rest of the venue was flooding "orderbook.unavailable" + "REST verify failed".
+    const DEFER_STORM_THRESHOLD = 2;
+    const NAKED_CANCEL_STORM_THRESHOLD = 2;
+    const replaceDeferred = (replaceCancel.deferredCount ?? 0) >= DEFER_STORM_THRESHOLD;
+    const nakedStorm = (replaceCancel.nakedCancelCount ?? 0) >= NAKED_CANCEL_STORM_THRESHOLD;
+    const systemicBookIssue = replaceDeferred || nakedStorm;
+    if (systemicBookIssue) {
+      this.store.recordEvent({
+        venue: options.venue,
+        severity: 'warn',
+        type: 'quote.systemic-book-issue-pause',
+        message: `Replace 周期检测到系统级盘口问题（推迟 ${replaceCancel.deferredCount} 单，裸奔防守 ${replaceCancel.nakedCancelCount} 单），暂停本轮新挂单`,
+        details: {
+          deferredCount: replaceCancel.deferredCount,
+          nakedCancelCount: replaceCancel.nakedCancelCount,
+          deferredTokenIds: replaceCancel.deferredTokenIds
+        }
+      });
+      this.recorder.runCheckpoint(options.venue, {
+        skippedQuoting: true,
+        systemicBookIssue: true,
+        deferredCount: replaceCancel.deferredCount,
+        nakedCancelCount: replaceCancel.nakedCancelCount
+      });
+      this.stage(options.venue, 'idle', '替换周期发现大盘口异常，本轮只撤单维护不挂新单', {
+        deferredCount: replaceCancel.deferredCount,
+        nakedCancelCount: replaceCancel.nakedCancelCount
+      });
+      return { skippedQuoting: true };
+    }
     const cashPause = this.cashNewOrderPause(options.venue);
     const dbDegraded = this.store.dbWriteDegraded();
     if (cashPause.active || dbDegraded) {
@@ -628,12 +670,16 @@ export class ExecutionEngine {
         this.stage(options.venue, 'idle', 'WS 推送成交保护本轮已执行，跳过新挂单', { wsProtectAt });
         return { skippedQuoting: true };
       }
+      // Filter out intents for tokens that were recently WS-retreated (2026-07-03 Predict incident:
+      // token retreated at 05:50:55, re-placed at 05:52:13, eaten 43s later). The retreat cooldown
+      // prevents immediate re-entry into a position whose book was just judged unsafe.
+      const placeable = this.filterRetreatCooldown(options.venue, replaceRace.placeable);
       const quoteCycle = await this.quoteCycleService.process({
         venue: options.venue,
         signer: options.signer,
         signerAddress,
         dayStart,
-        intents: replaceRace.placeable,
+        intents: placeable,
         books,
         balances,
         positions,
@@ -653,6 +699,36 @@ export class ExecutionEngine {
 
   async assertAccountRiskAllowsOrder(venue: VenueName, signerAddress: string, signer: SignerProvider): Promise<AccountRiskDecision> {
     return this.accountSync.accountRiskGate({ venue, signerAddress, signer, dayStart: accountRiskWindowStart(venue, this.store), scope: 'manual-order' });
+  }
+
+  /**
+   * Filter out intents whose token was recently retreated by WS book-retreat (A-3).
+   * A token just judged unsafe by the real-time WS path should not be immediately re-entered in the same
+   * or next cycle — the WS retreat indicates the book was thinning, and insufficient time has passed for
+   * the book to meaningfully rebuild (2026-07-03 Predict incident: retreated at 05:50:55, re-placed at
+   * 05:52:13 without any new market data, eaten 43s later).
+   */
+  private filterRetreatCooldown(venue: VenueName, intents: OrderIntent[]): OrderIntent[] {
+    const cooldowns = this.retreatedAt.get(venue);
+    if (!cooldowns || cooldowns.size === 0) return intents;
+    const now = Date.now();
+    const filtered = intents.filter((intent) => {
+      const retreatedAt = cooldowns.get(intent.tokenId);
+      if (!retreatedAt) return true;
+      if (now - retreatedAt < ExecutionEngine.RETREAT_COOLDOWN_MS) return false;
+      cooldowns.delete(intent.tokenId); // expired, clean up
+      return true;
+    });
+    if (filtered.length < intents.length) {
+      this.store.recordEvent({
+        venue,
+        severity: 'info',
+        type: 'quote.retreat-cooldown-skipped',
+        message: `撤退冷却期内，跳过 ${intents.length - filtered.length} 个 token 的新挂单`,
+        details: { skipped: intents.length - filtered.length, cooldownMs: ExecutionEngine.RETREAT_COOLDOWN_MS }
+      });
+    }
+    return filtered;
   }
 
   private previousRouteTokenIds(venue: VenueName): string[] {
@@ -1102,6 +1178,11 @@ export class ExecutionEngine {
         this.lastWsProtectAt.set(venue, Date.now());
         await this.adapter.cancelOrders(toCancel);
         this.store.markOrdersCanceled(venue, toCancel);
+        // Mark this token as retreated so the next cycle skips re-placing for RETREAT_COOLDOWN_MS.
+        // This prevents re-entering a position whose book was just judged unsafe by the WS path.
+        const tokenRetreats = this.retreatedAt.get(venue) ?? new Map();
+        tokenRetreats.set(tokenId, Date.now());
+        this.retreatedAt.set(venue, tokenRetreats);
         this.store.recordEvent({
           venue,
           severity: 'warn',

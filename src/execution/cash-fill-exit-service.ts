@@ -50,6 +50,25 @@ export class CashFillExitService {
    * window for a true duplicate is essentially nil right after startup.
    */
   private readonly recentExitSubmittedAt = new Map<string, number>();
+  /**
+   * Per-token exit-blocked strike counter (F2: exit dead-loop mitigation, 2026-07-03 Predict incident).
+   * When the market's best bid has dropped below the stop-loss floor for too many consecutive attempts,
+   * the liquidity vacuum is structural — not a transient wobble. After MAX_EXIT_BLOCKED_STRIKES, the
+   * exit strategy escalates from "wait at limit price" to "widen the loss cap and try a marketable sell."
+   * Successful exit OR 30 minutes without a blocked attempt clears the strikes.
+   */
+  private readonly exitBlockedStrikes = new Map<string, { count: number; firstAt: number }>();
+  static readonly MAX_EXIT_BLOCKED_STRIKES = 30;
+  static readonly AGGRESSIVE_EXIT_MAX_LOSS_PCT = 20;
+  /** After this many minutes without a new blocked strike, the counter resets (transient wobble assumption). */
+  private static readonly EXIT_BLOCKED_STRIKES_TTL_MS = 30 * 60_000;
+  /**
+   * F4: Per-token tracker of the most recent exit limit order we placed. If a limit order is already on
+   * the book for this token at the same price, skip creating a duplicate (2026-07-03 Predict incident:
+   * 715 exit-blocked events could have each created a new order flooding the venue). Cleared when
+   * the exit-blocked counter resets or on a successful exit.
+   */
+  private readonly lastExitLimitPrice = new Map<string, { price: number; placedAt: number }>();
 
   constructor(
     private readonly config: AppConfig,
@@ -135,20 +154,54 @@ export class CashFillExitService {
         continue;
       }
 
-      const plan = cashExitPlan(this.config, position, market, book, input.force === true);
+      // F2: Get the per-token consecutive exit-blocked count for escalation decisions.
+      // Stale strikes (not touched for EXIT_BLOCKED_STRIKES_TTL_MS) are removed — if the market
+      // went quiet for 30 minutes, the liquidity vacuum is resolved and we can reset.
+      const strikeKey = this.exitCacheKey(input.venue, position.tokenId);
+      const strikes = this.exitBlockedStrikes.get(strikeKey);
+      if (strikes && Date.now() - strikes.firstAt > CashFillExitService.EXIT_BLOCKED_STRIKES_TTL_MS) {
+        this.exitBlockedStrikes.delete(strikeKey);
+      }
+      const consecutiveBlocked = strikes ? strikes.count : 0;
+      const plan = cashExitPlan(this.config, position, market, book, input.force === true, consecutiveBlocked);
       if (!plan.ok) {
         blocked += 1;
+        // Track consecutive blocked strikes for escalation (F2).
+        if (strikes) {
+          strikes.count += 1;
+        } else {
+          this.exitBlockedStrikes.set(strikeKey, { count: 1, firstAt: Date.now() });
+        }
+        const strikeInfo = this.exitBlockedStrikes.get(strikeKey);
+        const strikeCount = strikeInfo?.count ?? 1;
+        const strikeMsg = strikeCount >= CashFillExitService.MAX_EXIT_BLOCKED_STRIKES
+          ? `（已连续 ${strikeCount} 次，触发降级）`
+          : '';
         this.store.recordEvent({
           venue: input.venue,
-          severity: 'warn',
+          severity: strikeCount >= CashFillExitService.MAX_EXIT_BLOCKED_STRIKES ? 'error' : 'warn',
           type: 'cash-fill.exit-blocked',
-          message: `${plan.reason}，挂 limit SELL 在止损价等成交`,
-          details: { position: publicPosition(position), market: publicMarket(market), book: publicBookTop(book), reject: plan.reject }
+          message: `${plan.reason}，挂 limit SELL 在止损价等成交${strikeMsg}`,
+          details: { position: publicPosition(position), market: publicMarket(market), book: publicBookTop(book), reject: plan.reject, consecutiveBlocked: strikeCount }
         });
         // When the loss cap blocks a marketable exit, post a limit SELL at the loss-cap price.
         // The order sits on the book earning rewards until filled or the position clears naturally.
         // Using `${venue}:` prefix excludes it from listManagedOpenOrders, so circuit-breaker
         // cancelAllManagedOrders leaves it alone.
+        // F4: Skip duplicate exit limit orders. Exit limit orders are not in listManagedOpenOrders
+        // (excluded by the venue prefix SQL filter), so use an in-memory tracker to avoid creating
+        // duplicate orders with the same token+price in the same session.
+        const exitLimitKey = this.exitCacheKey(input.venue, position.tokenId);
+        const lastLimit = this.lastExitLimitPrice.get(exitLimitKey);
+        if (lastLimit && plan.limitPrice !== undefined) {
+          const priceUnchanged = Math.abs(lastLimit.price - plan.limitPrice) < 1e-9;
+          const stillRecent = Date.now() - lastLimit.placedAt < RECENT_EXIT_SUPPRESS_MS;
+          if (priceUnchanged && stillRecent) {
+            // Same limit price, and the previous order is still fresh on the book. Skip.
+            blocked += 1;
+            continue;
+          }
+        }
         if (this.adapter.createOrder && plan.limitPrice !== undefined) {
           try {
             const limitIntent: OrderIntent = {
@@ -168,7 +221,11 @@ export class CashFillExitService {
             const result = await this.adapter.createOrder(limitIntent, input.signer);
             this.store.recordOrderResult(result);
             submitted += 1;
+            if (plan.limitPrice !== undefined) {
+              this.lastExitLimitPrice.set(exitLimitKey, { price: plan.limitPrice, placedAt: Date.now() });
+            }
             this.markExitSubmitted(input.venue, position.tokenId);
+            this.exitBlockedStrikes.delete(this.exitCacheKey(input.venue, position.tokenId));
           } catch (_limitError) {
             failed += 1;
           }
@@ -180,6 +237,7 @@ export class CashFillExitService {
         // Mark BEFORE awaiting — see RECENT_EXIT_SUPPRESS_MS doc above. Marking inside try means an unlikely
         // throw from markExitSubmitted itself falls into the same catch path as a submit failure.
         this.markExitSubmitted(input.venue, position.tokenId);
+        this.exitBlockedStrikes.delete(this.exitCacheKey(input.venue, position.tokenId));
         const result = await this.adapter.createMarketableOrder(plan.intent, input.signer);
         submitted += 1;
         this.store.recordOrderResult(result);
@@ -238,7 +296,8 @@ export function cashExitPlan(
   position: Position,
   market: Market,
   book: Orderbook,
-  force = false
+  force = false,
+  consecutiveBlocked = 0
 ): CashExitPlan {
   const best = bestBidAsk(book);
   if (best.bestBid === undefined) {
@@ -280,6 +339,78 @@ export function cashExitPlan(
       averagePrice: effectiveAveragePrice,
       limitPrice
     };
+  }
+  // Escalation: after MAX_EXIT_BLOCKED_STRIKES consecutive blocked attempts, the bestBid has been
+  // below the stop-loss floor for so long that the liquidity vacuum is structural, not transient.
+  // Widen the loss cap (10% → 20%) and attempt a marketable taker sell instead of waiting for a
+  // limit order that may never fill (2026-07-03 Predict incident: bid stayed at 13.2¢ while
+  // stop-loss was 21.9¢ for 66 minutes / 715 attempts). If even the widened cap is below the
+  // bestBid, there is literally no buyer at any acceptable price — give up with an explicit signal.
+  if (consecutiveBlocked >= CashFillExitService.MAX_EXIT_BLOCKED_STRIKES) {
+    if (!Number.isFinite(averagePrice) || averagePrice <= EPSILON) {
+      return {
+        ok: false,
+        reason: `现金单边降级退出缺少有效成交均价（已连续 ${consecutiveBlocked} 次阻塞）`,
+        reject: rejectReason('CASH_EXIT_AVERAGE_PRICE_MISSING', 'liquidation', 'cash-fill-exit')
+      };
+    }
+    const normalLossPct = Math.max(0, Math.min(100, config.strategy.cashMaxExitLossPct ?? 30));
+    const aggressiveLossPct = Math.max(normalLossPct, CashFillExitService.AGGRESSIVE_EXIT_MAX_LOSS_PCT);
+    const aggressiveLimit = clampLossFloorToTick(
+      averagePrice * (1 - aggressiveLossPct / 100),
+      effectiveOrderbookTick(market, book)
+    );
+    // Only escalate when the bestBid is structurally far below the stop-loss floor — this
+    // avoids escalating on a minor 1-tick wobble where the bid is at 21.8¢ and floor is 21.9¢.
+    const normalLimit = clampLossFloorToTick(
+      averagePrice * (1 - normalLossPct / 100),
+      effectiveOrderbookTick(market, book)
+    );
+    const deepLiquidityVacuum = best.bestBid + 1e-9 < normalLimit * 0.7;
+    if (!deepLiquidityVacuum) {
+      // Not a deep vacuum — the bestBid is close enough. Don't escalate yet; let the normal
+      // limit flow handle it (it might clear naturally in a cycle or two).
+      // Fall through to normal exit logic below.
+    } else if (best.bestBid + 1e-9 >= aggressiveLimit) {
+      // Escalate: bestBid is above the widened loss cap, so a marketable sell can execute.
+      const sellableSize = depthAtOrAbove(book, aggressiveLimit);
+      const size = Number(Math.min(position.size, sellableSize).toFixed(4));
+      if (!Number.isFinite(size) || size <= EPSILON) {
+        return {
+          ok: false,
+          reason: `现金单边降级退出(放宽至 ${aggressiveLossPct}%)在 ${aggressiveLimit.toFixed(4)} 以上没有足够买盘`,
+          reject: rejectReason('CASH_EXIT_DEPTH_UNAVAILABLE', 'liquidation', 'cash-fill-exit'),
+          limitPrice: aggressiveLimit
+        };
+      }
+      return {
+        ok: true,
+        intent: {
+          venue: market.venue,
+          market,
+          tokenId: position.tokenId,
+          side: 'SELL',
+          price: aggressiveLimit,
+          size,
+          notionalUsd: Number((size * aggressiveLimit).toFixed(4)),
+          postOnly: false,
+          liquidity: 'taker',
+          reduceOnly: true,
+          reason: `cash-fill-exit-escalated-${aggressiveLossPct}pct-blocked-${consecutiveBlocked}x`,
+          clientOrderId: `${market.venue}:${position.tokenId}-esc-exit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+        },
+        averagePrice,
+        limitPrice: aggressiveLimit
+      };
+    } else {
+      // BestBid is below even the widened cap — liquidity vacuum is total.
+      return {
+        ok: false,
+        reason: `现金单边降级退出被拦截(已连续 ${consecutiveBlocked} 次)：买一 ${best.bestBid.toFixed(4)} 低于降级止损 ${aggressiveLimit.toFixed(4)}(${aggressiveLossPct}%)`,
+        reject: rejectReason('CASH_EXIT_AGGRESSIVE_BLOCKED', 'liquidation', 'cash-fill-exit'),
+        limitPrice: aggressiveLimit
+      };
+    }
   }
   if (!Number.isFinite(averagePrice) || averagePrice <= EPSILON) {
     return {

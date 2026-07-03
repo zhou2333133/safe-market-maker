@@ -18,6 +18,12 @@ export interface CancelReplaceableOrdersResult {
   failedIds?: string[];
   /** The error string from the adapter on a failed cancel; undefined on success. */
   cancelError?: string;
+  /** 因盘口不可用/过期而推迟撤换的订单数量（从 deferredReasons 统计）。调用方用于判断本轮是否存在系统级盘口问题。 */
+  deferredCount: number;
+  /** 因 REST 验证失败（不可重试的网络/RPC 错误）而触发裸奔防守撤单的订单数量。0 表示 REST 路径正常。 */
+  nakedCancelCount: number;
+  /** 所有被推迟订单的 tokenId 去重集合。调用方用于决定是否跳过个别 token 的新挂单。 */
+  deferredTokenIds: string[];
 }
 
 export interface CancelReplaceableOrdersOptions {
@@ -192,7 +198,7 @@ export class CancelService {
         message: `自动路由快照为空，保留 ${managedOpenOrders.length} 个现有订单等待下一轮复检`,
         details: { reasons }
       });
-      return { openOrders, canceledIds: [] };
+      return { openOrders, canceledIds: [], deferredCount: 0, nakedCancelCount: 0, deferredTokenIds: [] };
     }
     const managedTokens = new Set([
       ...this.config.selectedMarkets[venue],
@@ -204,6 +210,7 @@ export class CancelService {
     const cancelReasons: Array<{ orderId: string; tokenId: string; side: string; reason: string }> = [];
     const deferredReasons: Array<{ orderId: string; tokenId: string; side: string; reason: string }> = [];
     const cancelGroups = new Set<string>();
+    let nakedCancelCount = 0;
     const marketTokensByGroup = groupTokensByMarket(this.config, markets);
     const maintenanceStaleState = readCashMaintenanceStaleState(this.store.getCheckpoint(cashMaintenanceStaleCheckpointKey(venue))?.value);
     const nextMaintenanceStaleState = new Map<string, CashMaintenanceStaleEntry>();
@@ -285,6 +292,7 @@ export class CancelService {
             side: order.side,
             reason: preVerify.reason
           });
+          if (!preVerify.verified) nakedCancelCount += 1;
           this.store.recordEvent({
             venue,
             severity: preVerify.verified ? 'warn' : 'info',
@@ -528,7 +536,8 @@ export class CancelService {
       });
     }
     if (ids.length === 0) {
-      return { openOrders, canceledIds: [] };
+      const deferredTokenIds = [...new Set(deferredReasons.map(d => d.tokenId))];
+      return { openOrders, canceledIds: [], deferredCount: deferredReasons.length, nakedCancelCount, deferredTokenIds };
     }
     await this.adapter.cancelOrders(ids);
     this.store.markOrdersCanceled(venue, ids);
@@ -544,7 +553,15 @@ export class CancelService {
     this.updateExitLiquidityCooldown(venue, cancelReasons, managedOpenOrders.filter((order) => cancelIds.has(order.externalId)));
 
     const canceledTokenIds = [...new Set(managedOpenOrders.filter((order) => cancelIds.has(order.externalId)).map((order) => order.tokenId))];
-    return { openOrders: openOrders.filter((order) => !ids.includes(order.externalId)), canceledIds: ids, canceledTokenIds };
+    const deferredTokenIds = [...new Set(deferredReasons.map(d => d.tokenId))];
+    return {
+      openOrders: openOrders.filter((order) => !ids.includes(order.externalId)),
+      canceledIds: ids,
+      canceledTokenIds,
+      deferredCount: deferredReasons.length,
+      nakedCancelCount,
+      deferredTokenIds
+    };
   }
 
   private updateExitLiquidityCooldown(
@@ -565,7 +582,7 @@ export class CancelService {
   ): Promise<CancelReplaceableOrdersResult> {
     const managedOpenOrders = this.managedOpenOrders(venue, openOrders);
     const ids = [...new Set(managedOpenOrders.map((order) => order.externalId).filter(Boolean))];
-    if (ids.length === 0) return { openOrders, canceledIds: [] };
+    if (ids.length === 0) return { openOrders, canceledIds: [], deferredCount: 0, nakedCancelCount: 0, deferredTokenIds: [] };
     // Stop-loss cancel with retry + verification. Predict (and occasionally Polymarket) REST cancel
     // may return 200 without actually removing the on-chain order. We retry up to N times and verify
     // each round via getOpenOrders so we never mark an order CANCELED in local DB while it's still
@@ -639,7 +656,7 @@ export class CancelService {
         message: `${reason}：撤单调用全部失败(${MANAGED_CANCEL_MAX_ATTEMPTS}次重试)，本轮保留本地订单状态待下轮对账`,
         details: { ids: remainingIds, reason, error: lastCancelError ?? '未知', semantics: cancelSemantics(venue) }
       });
-      return { openOrders, canceledIds: [], failedIds: ids, cancelError: lastCancelError ?? '撤单全部失败' };
+      return { openOrders, canceledIds: [], failedIds: ids, cancelError: lastCancelError ?? '撤单全部失败', deferredCount: 0, nakedCancelCount: 0, deferredTokenIds: [] };
     }
     this.store.recordEvent({
       venue,
@@ -658,6 +675,9 @@ export class CancelService {
     return {
       openOrders: openOrders.filter((order) => !allCanceledIds.has(order.externalId)),
       canceledIds: verifiedCanceled,
+      deferredCount: 0,
+      nakedCancelCount: 0,
+      deferredTokenIds: [],
       ...(hasRemaining ? { failedIds: remainingIds, cancelError: lastCancelError ?? '平台仍返回该订单' } : {})
     };
   }
