@@ -571,6 +571,45 @@ export class ExecutionEngine {
         deferredCount: replaceCancel.deferredCount,
         nakedCancelCount: replaceCancel.nakedCancelCount
       });
+      // F5: When systemic book issues are detected, also cancel resting BUY orders whose
+      // token books are stale. These orders have no A-3 (WS retreat) protection because
+      // the WS channel isn't pushing updated book data — and three full cycles of
+      // shouldRetreatThinFront have already passed them on stale WS-cache data.
+      // Polymarket 2026-07-03: token 1052640… rested 2min 44s with zero WS updates,
+      // passed shouldRetreatThinFront in three cycles, fill executed 6s before the
+      // on-chain cancel landed.
+      const STALE_CANCEL_MS = 30_000;
+      const staleCancelIds: string[] = [];
+      for (const order of openOrders) {
+        if (order.side !== 'BUY') continue;
+        const book = books.get(order.tokenId);
+        if (!book) continue;
+        if (Date.now() - book.receivedAt > STALE_CANCEL_MS) {
+          staleCancelIds.push(order.externalId);
+        }
+      }
+      if (staleCancelIds.length > 0) {
+        try {
+          await this.adapter.cancelOrders(staleCancelIds);
+          this.store.markOrdersCanceled(options.venue, staleCancelIds);
+          openOrders = openOrders.filter(o => !staleCancelIds.includes(o.externalId));
+          this.store.recordEvent({
+            venue: options.venue,
+            severity: 'warn',
+            type: 'quote.systemic-book-issue-cancel-stale',
+            message: `系统性盘口异常，已主动撤 ${staleCancelIds.length} 个 stale-book 挂单防裸奔（阈值 ${STALE_CANCEL_MS / 1000}s）`,
+            details: { staleOrderIds: staleCancelIds, staleCancelMs: STALE_CANCEL_MS, deferredCount: replaceCancel.deferredCount }
+          });
+        } catch (cancelErr) {
+          this.store.recordEvent({
+            venue: options.venue,
+            severity: 'error',
+            type: 'quote.systemic-book-issue-cancel-failed',
+            message: cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
+            details: { staleOrderIds: staleCancelIds }
+          });
+        }
+      }
       return { skippedQuoting: true };
     }
     const cashPause = this.cashNewOrderPause(options.venue);
