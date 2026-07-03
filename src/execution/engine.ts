@@ -1189,8 +1189,40 @@ export class ExecutionEngine {
       // same parameters, same answer.
       const toCancel: string[] = [];
       const reasons: Array<{ orderId: string; reason: string }> = [];
+      // F7: When the WS-cached book is stale, shouldRetreatThinFront returns null ("can't verify") and
+      // the order sits blind. Before falling back to F6's age-based cancel, try a REST fetch to get a
+      // fresh book and re-evaluate. This covers the "WS snapshot was fresh at subscription but no
+      // price_change deltas arrived since" scenario — the cache shows old data while the real book
+      // may have thinned. The REST book is used ONLY for this check (not primed into WS cache, to
+      // avoid suppressing subsequent price_change deltas — see polymarket-ws.ts applyChanges guard).
+      // REST failure falls through to F6's age-based cancel as before.
+      let restBook: Orderbook | undefined;
+      let restBookAttempted = false;
+      const wsBookStale = book ? Date.now() - book.receivedAt > this.config.risk.staleBookMs : true;
+      if (wsBookStale && this.adapter.getOrderbookRest) {
+        restBookAttempted = true;
+        try {
+          restBook = await this.adapter.getOrderbookRest(tokenId);
+        } catch {
+          // REST failed — leave restBook undefined, F6 age-based cancel handles it below.
+        }
+      }
       for (const order of managed) {
-        const retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
+        // If WS cache was stale but REST gave us a fresh book, re-check with the fresh book FIRST.
+        let retreat = shouldRetreatThinFront(this.config, venue, order, market, book);
+        if (!retreat && wsBookStale && restBook) {
+          retreat = shouldRetreatThinFront(this.config, venue, order, market, restBook);
+          if (retreat) {
+            toCancel.push(order.externalId);
+            reasons.push({
+              orderId: order.externalId,
+              reason: `REST 刷新盘口后发现不安全（WS 缓存已过期 ${Math.round((Date.now() - (book?.receivedAt ?? Date.now())) / 1000)}s），即时撤退`
+            });
+            continue;
+          }
+          // REST book says safe — skip F6's age-based cancel, the order is verified on fresh data.
+          continue;
+        }
         if (!retreat) {
           // F6-A: shouldRetreatThinFront returns null for stale books — but stale book means
           // we CAN'T verify the order is safe. If the order has been resting long enough that
@@ -1198,6 +1230,10 @@ export class ExecutionEngine {
           // Polymarket 2026-07-03: token rested 26s with zero WS pushes, A-3 never triggered
           // because no push arrived. When a push DOES arrive for a different token, this
           // callback runs — and checking stale book here catches the blind ones.
+          // F7 note: if restBookAttempted is true but restBook is undefined, REST failed —
+          // F6 is the last line of defense. If restBook existed but said "safe", we already
+          // continued above. Reaching here means either non-stale WS book (restBook not fetched)
+          // or REST failed on a stale WS book.
           if (book) {
             const bookAgeMs = Date.now() - book.receivedAt;
             const orderAgeMs = order.placedAt ? Date.now() - order.placedAt : 0;
@@ -1206,7 +1242,7 @@ export class ExecutionEngine {
               toCancel.push(order.externalId);
               reasons.push({
                 orderId: order.externalId,
-                reason: `盘口过期 ${Math.round(bookAgeMs / 1000)}s 且订单已挂 ${Math.round(orderAgeMs / 1000)}s，WS 推送盲区内主动撤退`
+                reason: `盘口过期 ${Math.round(bookAgeMs / 1000)}s 且订单已挂 ${Math.round(orderAgeMs / 1000)}s，WS 推送盲区内主动撤退${restBookAttempted ? '（REST 刷新失败，回退年龄撤单）' : ''}`
               });
             }
           }
