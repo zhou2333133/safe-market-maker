@@ -25,6 +25,11 @@ interface PredictWsMessage {
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5000;
+// PredictFun server probes heartbeat every 15s; allow 3 probe cycles (45s) before treating
+// the connection as half-open. Covers 2 missed probes + 1 grace cycle. See
+// https://dev.predict.fun/heartbeats-1915508m0
+const HEARTBEAT_TIMEOUT_MS = 45_000;
+const HEARTBEAT_CHECK_INTERVAL_MS = 5_000;
 
 export class PredictWsClient {
   private socket?: WebSocket;
@@ -44,6 +49,12 @@ export class PredictWsClient {
   private keepAlive = false;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnectAttempts = 0;
+  /** Timestamp of the last heartbeat received from the server. The heartbeat-watch timer closes
+   *  the socket when this goes stale beyond HEARTBEAT_TIMEOUT_MS, so a half-open connection
+   *  (socket OPEN but server stopped probing) is detected within ~45s instead of waiting for
+   *  an OS-level close event that may never arrive. */
+  private lastHeartbeatAt = 0;
+  private heartbeatCheckTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly wsUrl: string,
@@ -162,6 +173,10 @@ export class PredictWsClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    if (this.heartbeatCheckTimer) {
+      clearInterval(this.heartbeatCheckTimer);
+      this.heartbeatCheckTimer = undefined;
+    }
     this.socket?.close();
     this.socket = undefined;
     this.connected = false;
@@ -208,6 +223,8 @@ export class PredictWsClient {
         socket.on('close', () => this.onDisconnect());
         socket.on('error', () => this.onDisconnect());
         this.reconnectAttempts = 0;
+        this.lastHeartbeatAt = Date.now();
+        this.startHeartbeatWatch(socket);
         this.sendSubscribeBatched([...this.desiredTopics]);
         resolve();
       });
@@ -225,7 +242,29 @@ export class PredictWsClient {
     this.socket = undefined;
     this.connecting = undefined;
     this.activeTopics.clear();
+    if (this.heartbeatCheckTimer) {
+      clearInterval(this.heartbeatCheckTimer);
+      this.heartbeatCheckTimer = undefined;
+    }
     if (this.keepAlive && this.desiredTopics.size > 0) this.scheduleReconnect();
+  }
+
+  /**
+   * Heartbeat staleness watchdog. The server probes every 15s; if we haven't seen a heartbeat
+   * within HEARTBEAT_TIMEOUT_MS the socket is half-open (server stopped probing but the OS
+   * hasn't delivered a close event). Force-close to trigger the existing onDisconnect →
+   * scheduleReconnect path — never call onDisconnect directly, so the state machine stays
+   * single-path through the 'close' event.
+   */
+  private startHeartbeatWatch(socket: WebSocket): void {
+    if (this.heartbeatCheckTimer) clearInterval(this.heartbeatCheckTimer);
+    this.heartbeatCheckTimer = setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - this.lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
+        try { socket.close(); } catch { /* already closing */ }
+      }
+    }, HEARTBEAT_CHECK_INTERVAL_MS);
+    this.heartbeatCheckTimer.unref?.();
   }
 
   private scheduleReconnect(): void {
@@ -256,6 +295,7 @@ export class PredictWsClient {
     if (!message || typeof message !== 'object') return;
     const parsed = message as PredictWsMessage;
     if (parsed.type === 'M' && parsed.topic === 'heartbeat') {
+      this.lastHeartbeatAt = Date.now();
       this.send({ method: 'heartbeat', data: parsed.data });
       return;
     }
