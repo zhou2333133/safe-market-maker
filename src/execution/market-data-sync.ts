@@ -385,10 +385,15 @@ export class MarketDataSyncService {
   private planOrderbookMarkets(venue: VenueName, markets: Market[], allMarkets: Market[], activeMarkets: Market[] = []): Market[] {
     if (!this.config.strategy.autoSelectMarkets) return markets;
     const forceFullScan = this.shouldRunFullRouteScan(venue);
+    const routeAudit = this.store.getCheckpoint(`route-audit.${venue}`)?.value;
+    const coveragePct = routeAudit && typeof routeAudit === 'object'
+      ? Number((routeAudit as Record<string, unknown>).coveragePct)
+      : undefined;
     const plan = planMarketOrderbookScan(this.config, venue, mergeMarkets(allMarkets, activeMarkets), {
       activeTokenIds: activeMarkets.map((market) => market.tokenId),
       forceFullScan,
-      suppressedTokenIds: this.unavailableCooldownTokenIds(venue)
+      suppressedTokenIds: this.unavailableCooldownTokenIds(venue),
+      coveragePct: Number.isFinite(coveragePct) ? coveragePct : undefined
     });
     this.store.recordMetric('api.orderbook_scan_planned', plan.markets.length, { venue, active: plan.active.length, hot: plan.hot.length, explore: plan.explore.length, fullScan: plan.fullScan });
     if (plan.fullScan) {

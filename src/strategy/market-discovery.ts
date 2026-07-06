@@ -32,6 +32,7 @@ export interface MarketOrderbookScanPlanOptions {
   activeTokenIds?: Iterable<string>;
   forceFullScan?: boolean;
   suppressedTokenIds?: Iterable<string>;
+  coveragePct?: number;
 }
 
 const exploreCursors = new Map<string, number>();
@@ -127,7 +128,7 @@ export function planMarketOrderbookScan(
   );
   const rateBudget = orderbookScanRateBudget(config, active.length, venue);
   const nonActiveBudget = Math.max(0, rateBudget - active.length);
-  const constrainedSlot = constrainedNonActiveSlot(config, venue, nonActiveBudget, maxTokensPerMarket);
+  const constrainedSlot = constrainedNonActiveSlot(config, venue, nonActiveBudget, maxTokensPerMarket, options.coveragePct);
   const exploreBudget = constrainedSlot === 'explore'
     ? nonActiveBudget
     : constrainedSlot === 'hot'
@@ -246,9 +247,10 @@ function constrainedNonActiveSlot(
   config: AppConfig,
   venue: VenueName,
   nonActiveBudget: number,
-  maxTokensPerMarket: number
+  maxTokensPerMarket: number,
+  coveragePct?: number
 ): 'hot' | 'explore' | undefined {
-  if (config.strategy.entryMode === 'cash' && nonActiveBudget > 0) return 'explore';
+  if (config.strategy.entryMode === 'cash' && (coveragePct ?? 0) < 30 && nonActiveBudget > 0) return 'explore';
   if (nonActiveBudget < maxTokensPerMarket) return undefined;
   if (nonActiveBudget >= maxTokensPerMarket * 2) return undefined;
   const cursorKey = [
