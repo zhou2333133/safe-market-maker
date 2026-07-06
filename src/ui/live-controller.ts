@@ -6,6 +6,7 @@ import type { AppConfig } from '../config/schema.js';
 import type { OpenOrder, Market } from '../domain/types.js';
 import { runPreflight } from '../execution/preflight.js';
 import { usingStore } from '../store/ui-store.js';
+import type { StateStore } from '../store/sqlite.js';
 import { HttpError } from '../venues/http.js';
 import { logger } from '../observability/logger.js';
 import { recordUiEvent } from './telemetry.js';
@@ -259,6 +260,10 @@ async function runLiveLoop(
   loop: LiveLoopState
 ): Promise<void> {
   try {
+    // Store is loop-scoped (not cycle-scoped) so WS callbacks (protectOnBookUpdate / protectOnFill)
+    // that fire between cycles can still access the DB. Closing per-cycle caused "The database connection
+    // is not open" in 99.85% of A-3 protection attempts.
+    let sharedStore: StateStore | undefined;
     while (!loop.stopRequested) {
       // Inter-cycle stall watchdog: if the last cycle completed normally but the next iteration
       // has not started within INTER_CYCLE_STALL_MS, the transition between cycles is deadlocked
@@ -308,7 +313,7 @@ async function runLiveLoop(
           adapter = await createVenueForUi(loaded.config, loaded.dataDir, venue, signer, passphrase);
           liveAdapterCache.set(venue, { adapter, key: adapterKey });
         }
-        const store = usingStore(loaded.dataDir);
+        const store = sharedStore ?? (sharedStore = usingStore(loaded.dataDir));
         // Fast quote-refresh cadence (`fast` computed above): between full discovery cycles, run lighter ticks that
         // only re-quote already-active markets (skip the full-universe audit) so resting orders stay pinned to their
         // level. A full cycle is due once fullCycleMs has elapsed since the last one; venues with fastQuoteMs/
@@ -419,7 +424,7 @@ async function runLiveLoop(
             });
           }
         } finally {
-          store.close();
+          // store lifecycle is now loop-scoped — see sharedStore declaration in runLiveLoop
         }
         await waitForNextCycleInterleaved(
           loop, loaded.config, loaded.dataDir, venue, adapter, nextCycleMs
@@ -450,6 +455,7 @@ async function runLiveLoop(
     recordUiEvent(configPath, venue, 'warn', 'ui.live.loop.stopped', `实盘循环已真正停止，共完成 ${loop.cycles} 轮`, { cycles: loop.cycles });
     checkpointLiveStage(configPath, venue, 'idle', '实盘循环已真正停止');
   } finally {
+    sharedStore?.close();
     liveAdapterCache.delete(venue);
     resetLoopRuntimeHandles(loop);
   }
