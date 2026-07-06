@@ -258,11 +258,11 @@ async function runLiveLoop(
   signer: SignerProvider,
   loop: LiveLoopState
 ): Promise<void> {
+  // Store is loop-scoped (not cycle-scoped) so WS callbacks (protectOnBookUpdate / protectOnFill)
+  // that fire between cycles can still access the DB. Closing per-cycle caused "The database connection
+  // is not open" in 99.85% of A-3 protection attempts.
+  let sharedStore: ReturnType<typeof usingStore> | undefined;
   try {
-    // Store is loop-scoped (not cycle-scoped) so WS callbacks (protectOnBookUpdate / protectOnFill)
-    // that fire between cycles can still access the DB. Closing per-cycle caused "The database connection
-    // is not open" in 99.85% of A-3 protection attempts.
-    let sharedStore: ReturnType<typeof usingStore> | undefined;
     while (!loop.stopRequested) {
       // Inter-cycle stall watchdog: if the last cycle completed normally but the next iteration
       // has not started within INTER_CYCLE_STALL_MS, the transition between cycles is deadlocked
