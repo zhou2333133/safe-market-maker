@@ -6,7 +6,6 @@ import type { AppConfig } from '../config/schema.js';
 import type { OpenOrder, Market } from '../domain/types.js';
 import { runPreflight } from '../execution/preflight.js';
 import { usingStore } from '../store/ui-store.js';
-import type { StateStore } from '../store/sqlite.js';
 import { HttpError } from '../venues/http.js';
 import { logger } from '../observability/logger.js';
 import { recordUiEvent } from './telemetry.js';
@@ -263,7 +262,7 @@ async function runLiveLoop(
     // Store is loop-scoped (not cycle-scoped) so WS callbacks (protectOnBookUpdate / protectOnFill)
     // that fire between cycles can still access the DB. Closing per-cycle caused "The database connection
     // is not open" in 99.85% of A-3 protection attempts.
-    let sharedStore: StateStore | undefined;
+    let sharedStore: ReturnType<typeof usingStore> | undefined;
     while (!loop.stopRequested) {
       // Inter-cycle stall watchdog: if the last cycle completed normally but the next iteration
       // has not started within INTER_CYCLE_STALL_MS, the transition between cycles is deadlocked
