@@ -4,6 +4,8 @@ import path from 'node:path';
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { ensureDataDirs, loadConfig } from '../config/load.js';
+import { findDeadTopLevelPrefixedStrategyKeys } from '../config/venue-config.js';
+import { startRetentionTimer } from '../store/sqlite.js';
 import { appCss, appHtml, appScript } from './assets.js';
 import { liveStatus, markLoopError, type LiveLoops } from './live-loop-state.js';
 import { UiError } from './errors.js';
@@ -92,6 +94,24 @@ function installGlobalRejectionGuard(): void {
   });
 }
 
+/**
+ * The @predictdotfun SDK logs `[WARN]: When using a Predict account the maker and signer are ignored.` from its
+ * OrderBuilder on EVERY order build (via console.warn). It is harmless noise but floods stderr (thousands of lines per
+ * run). Drop exactly that line at the process level. NOTE: this is SDK-emitted, not our code — the only safe fix is to
+ * filter it at the console sink; we cannot "move it to init" because we do not control the SDK's per-build call.
+ */
+let predictSdkNoiseFilterInstalled = false;
+function installPredictSdkNoiseFilter(): void {
+  if (predictSdkNoiseFilterInstalled) return;
+  predictSdkNoiseFilterInstalled = true;
+  const originalWarn = console.warn.bind(console);
+  console.warn = function (...args: unknown[]): void {
+    const head = typeof args[0] === 'string' ? args[0] : String(args[0] ?? '');
+    if (head.includes('maker and signer are ignored')) return;
+    originalWarn(...(args as Parameters<typeof console.warn>));
+  } as typeof console.warn;
+}
+
 function extractHostname(hostHeader: string): string {
   return hostHeader.split(':')[0]?.replace(/^\[|\]$/g, '') ?? '';
 }
@@ -136,6 +156,14 @@ export async function startUiServer(configPath: string, options: UiServerOptions
   const loaded = loadConfig(configPath);
   ensureDataDirs(loaded.dataDir);
   installGlobalRejectionGuard();
+  installPredictSdkNoiseFilter();
+  startRetentionTimer(loaded.dataDir);
+  const deadStrategyKeys = findDeadTopLevelPrefixedStrategyKeys(loaded.config);
+  if (deadStrategyKeys.length > 0) {
+    logger.warn(
+      `配置陷阱: 顶层 strategy 中的以下键实际不生效(生效值在对应 venue 块), 请改到 polymarketParams/predictParams: ${deadStrategyKeys.join(', ')}`
+    );
+  }
   const singleton = acquireUiSingleton(loaded.configPath, loaded.dataDir, host, port, options.enforceSingleton !== false);
   const uiToken = randomBytes(32).toString('hex');
   const liveLoops: LiveLoops = new Map();
@@ -250,6 +278,7 @@ function startLoopStaleWatchdog(dataDir: string, liveLoops: LiveLoops): NodeJS.T
   const LOOP_STALE_THRESHOLD_MS = 30 * 60 * 1000;
   const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
   const lastAlertedAt = new Map<string, number>();
+  const lastIntentionalStopInfoAt = new Map<string, number>();
   const tick = async (): Promise<void> => {
     try {
       const { StateStore } = await import('../store/sqlite.js');
@@ -272,6 +301,25 @@ function startLoopStaleWatchdog(dataDir: string, liveLoops: LiveLoops): NodeJS.T
           const stalenessMs = now - stalenessRef;
           if (stalenessMs <= LOOP_STALE_THRESHOLD_MS) {
             lastAlertedAt.delete(venue);
+            continue;
+          }
+          // Intentional-stop guard: if the loop was deliberately halted (risk-stop / user-stop), a stale cycle is
+          // by-design — restoreLiveLoops never auto-resumes these, so the error below would be a FALSE alarm that
+          // hides the real to-do (manual recovery in the UI). Downgrade to a single info event and skip auto-recovery.
+          const stageCp = store.getCheckpoint('stage.' + venue);
+          const stageVal = stageCp?.value as { stage?: string; source?: string } | undefined;
+          if (stageVal && (stageVal.source === 'risk-stop' || stageVal.source === 'user-stop')) {
+            const lastInfoMs = lastIntentionalStopInfoAt.get(venue) ?? 0;
+            if (now - lastInfoMs >= LOOP_STALE_THRESHOLD_MS) {
+              lastIntentionalStopInfoAt.set(venue, now);
+              store.recordEvent({
+                venue,
+                severity: 'info',
+                type: 'loop-stale-intentional-stop',
+                message: `${venue} 实盘循环为主动停止（source=${stageVal.source}），非卡死，无需处理`,
+                details: { lastCycleAt: lastCycle, stalenessMs, source: stageVal.source }
+              });
+            }
             continue;
           }
           // Re-alert at most once per stale window (every 30min) so we don't spam.

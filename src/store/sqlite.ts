@@ -8,12 +8,30 @@ import { RiskRepository, type AccountEquityPoint, type FillSummary } from './ris
 import { stateStoreSchemaSql } from './schema.js';
 import { configureForensicLog, forensicLogEvent, pruneOldForensicFiles } from '../observability/forensic-log.js';
 
-// Retention windows: events/metrics in SQLite kept for 7d (hot tier, queried by UI + audit), forensic JSONL on disk
+// Retention windows: events/metrics/orders(non-open)/account_risk_* in SQLite kept for 24h (SQLITE_RETENTION_MS; hot tier, queried by UI + audit), forensic JSONL on disk
 // kept for 3d (cold archive, post-hoc complete record). Production observed ~1.5GB/day forensic growth (POLY's
 // order.ws-update fires ~2.3k/min and dominates), so 3d ≈ 4.5GB on disk — comfortable. Original 30d was sized
 // against a 60MB/day estimate that's ~25x off. Both auto-pruned at store-open so a long-running bot self-maintains.
 const SQLITE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const FORENSIC_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+
+let retentionTimer: ReturnType<typeof setInterval> | undefined;
+/**
+ * Self-maintaining retention: opens its own short-lived StateStore every 6h to purge expired rows, so a bot that
+ * runs for weeks without restarting does not accumulate unbounded events/metrics/orders/risk history. Singleton —
+ * safe to call from multiple startup paths; only the first call arms the timer.
+ */
+export function startRetentionTimer(dataDir: string): void {
+  if (retentionTimer) return;
+  const dbPath = path.join(dataDir, 'state.sqlite');
+  retentionTimer = setInterval(() => {
+    try {
+      const s = new StateStore(dbPath);
+      try { s.pruneRetention(path.dirname(dbPath)); } finally { s.close(); }
+    } catch { /* retention must never crash the process */ }
+  }, 6 * 60 * 60 * 1000);
+  retentionTimer.unref?.();
+}
 
 export class StateStore {
   private readonly db: Database.Database;
@@ -36,15 +54,24 @@ export class StateStore {
   }
 
   /**
-   * Best-effort retention: drop events/metrics older than 7d from SQLite and any forensic JSONL files older than 30d.
-   * Runs once at constructor time. Wrapped in try/catch — retention must never block the bot from starting.
+   * Best-effort retention: drop events/metrics/orders(non-open)/account_risk_* rows older than 24h (SQLITE_RETENTION_MS)
+   * from SQLite and any forensic JSONL files older than 3d. Also invoked periodically via startRetentionTimer so a
+   * long-running bot self-maintains without depending on restarts. Wrapped in try/catch — retention must never block startup.
    */
-  private pruneRetention(dataDir: string): void {
+  /** Public so startRetentionTimer can invoke it on a cadence; see class JSDoc for what it purges. */
+  pruneRetention(dataDir: string): void {
     try {
       const cutoff = Date.now() - SQLITE_RETENTION_MS;
       const evDel = this.db.prepare('DELETE FROM events WHERE ts < ?').run(cutoff).changes;
       const meDel = this.db.prepare('DELETE FROM metrics WHERE ts < ?').run(cutoff).changes;
-      if (evDel > 100000 || meDel > 100000) {
+      // Orders still OPEN represent live managed positions — never delete those. Only purge terminal states
+      // (CANCELED / UNKNOWN / REJECTED) once aged out, otherwise reconciliation loses fill history.
+      const ordDel = this.db
+        .prepare("DELETE FROM orders WHERE status IN ('CANCELED','UNKNOWN','REJECTED') AND updated_at < ?")
+        .run(cutoff).changes;
+      const snapDel = this.db.prepare('DELETE FROM account_risk_snapshots WHERE ts < ?').run(cutoff).changes;
+      const decDel = this.db.prepare('DELETE FROM account_risk_decisions WHERE ts < ?').run(cutoff).changes;
+      if (evDel + meDel + ordDel + snapDel + decDel > 100000) {
         // Reclaim disk after large purge so the file actually shrinks.
         this.db.exec('VACUUM');
       }

@@ -92,3 +92,22 @@ export function resolveVenueConfig(config: AppConfig, venue: VenueName): AppConf
   // branch above so neither venue can observe the other's prefixed parameters at runtime.
   return { ...config, risk, strategy: stripVenuePrefixedStrategy(params.strategy, 'polymarket') };
 }
+
+const VENUE_PREFIXES: ReadonlyArray<VenueName> = ['polymarket', 'predict'];
+/**
+ * Detect top-level `strategy` keys that are venue-prefixed (e.g. `polymarketFrontDepthUsd`) yet the corresponding
+ * venue block (polymarketParams / predictParams) exists. resolveVenueConfig only reads the venue block, so these
+ * top-level keys are silently IGNORED — a configuration trap (edits there look like they should work but don't).
+ * Returns the offending key names so the UI can warn once at startup. Pure read, no mutation.
+ */
+export function findDeadTopLevelPrefixedStrategyKeys(config: AppConfig): string[] {
+  const dead: string[] = [];
+  const strategy = (config.strategy ?? {}) as Record<string, unknown>;
+  for (const key of Object.keys(strategy)) {
+    const venue = VENUE_PREFIXES.find((v) => key.startsWith(v));
+    if (!venue) continue;
+    const block = venue === 'polymarket' ? config.polymarketParams : config.predictParams;
+    if (block) dead.push(key);
+  }
+  return dead;
+}
