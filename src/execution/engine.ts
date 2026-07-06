@@ -397,6 +397,29 @@ export class ExecutionEngine {
         const firstDisconnectedAt = wsDisconnectedSince.get(options.venue);
         if (firstDisconnectedAt === undefined) {
           wsDisconnectedSince.set(options.venue, now);
+          // WS 断线 = 无法实时监控盘口 → 无条件撤出所有 Predict 受管挂单
+          const managed = this.store.listManagedOpenOrders(options.venue);
+          if (managed.length > 0) {
+            try {
+              const ids = managed.map((o) => o.externalId);
+              await this.adapter.cancelOrders(ids);
+              this.store.markOrdersCanceled(options.venue, ids);
+              this.recorder.event({
+                venue: options.venue,
+                severity: 'warn',
+                type: 'ws.health.cancel-all-disconnect',
+                message: `WS 断线，无法实时监控盘口，撤销全部 ${managed.length} 个受管挂单`,
+                details: { canceledIds: ids }
+              });
+            } catch (error) {
+              this.recorder.event({
+                venue: options.venue,
+                severity: 'error',
+                type: 'ws.health.cancel-all-disconnect-failed',
+                message: error instanceof Error ? error.message : String(error)
+              });
+            }
+          }
         } else if (now - firstDisconnectedAt > 120_000) {
           wsDisconnectedSince.delete(options.venue);
           throw new Error(`Predict WS reconnection timed out after ${Math.round((now - firstDisconnectedAt) / 1000)}s`);

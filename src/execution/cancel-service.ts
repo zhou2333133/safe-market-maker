@@ -230,7 +230,7 @@ export class CancelService {
         if (!market) continue;
         const book = books.get(order.tokenId);
         const orderAgeMs = order.placedAt ? now - order.placedAt : 0;
-        if (orderAgeMs > 30_000 && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
+        if (orderAgeMs > 30_000 && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book)) && venue !== 'predict') {
           pending.push({ orderId: order.externalId, order, market });
         }
       }
@@ -296,7 +296,7 @@ export class CancelService {
           });
           continue;
         }
-      } else if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book))) {
+      } else if (longNakedRest && market && isCashProtectedBuyOrder(this.config, order, market) && (!book || isStaleBook(this.config, book)) && venue !== 'predict') {
         // Defensive: pre-pass missed this order (shouldn't happen in practice). Cancel rather than
         // let a naked order sit unprotected — no fresh book means we can't verify protection,
         // and keeping an order we can't supervise is worse than missing rewards.

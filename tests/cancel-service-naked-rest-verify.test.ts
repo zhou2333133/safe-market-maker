@@ -133,11 +133,9 @@ function thinFrontBook(tokenId = 'tokA'): Orderbook {
 }
 
 describe('CancelService.cancelReplaceableOrders — REST verify before naked-rest panic cancel', () => {
-  it('(a) REST returns healthy book → keeps order + records quote.protect-rest-verify-kept', async () => {
+  it('(a) Predict skips REST verify — order flows to shouldRetreatThinFront instead (no REST call)', async () => {
     const store = tempStore();
     const adapter = makeAdapter(async () => healthyBook());
-    // For this test the focus is the VERIFY-KEPT path alone. We disable cancelOutsideReward so the subsequent
-    // post-verify branches don't second-guess the result. The other tests (b/c/d/e) keep default config.
     const keptOnlyConfig = appConfigSchema.parse({
       strategy: {
         entryMode: 'cash',
@@ -156,21 +154,22 @@ describe('CancelService.cancelReplaceableOrders — REST verify before naked-res
     const result = await svc.cancelReplaceableOrders(
       'predict',
       [order],
-      [], // no intents — the verify-kept path is the only assertion target here
+      [],
       [market],
-      new Map() // empty books → triggers naked-rest path
+      new Map() // empty books → would trigger REST verify on Polymarket, Predict skips
     );
+    // Predict WS pushes full snapshots: stale book = no change, cached book is valid.
+    // shouldRetreatThinFront returns null on no-book (not a retreat trigger on Predict).
     expect(result.canceledIds).toHaveLength(0);
-    expect(adapter.getOrderbook).toHaveBeenCalledTimes(1);
-    expect(adapter.primeBook).toHaveBeenCalledTimes(1);
+    expect(adapter.getOrderbook).not.toHaveBeenCalled();
+    expect(adapter.primeBook).not.toHaveBeenCalled();
     const recents = (store as any).listRecentEvents(20);
     const keptEvt = recents.find((e: any) => e.type === 'quote.protect-rest-verify-kept');
-    expect(keptEvt).toBeDefined();
-    expect(keptEvt.severity).toBe('info');
+    expect(keptEvt).toBeUndefined(); // Predict skips this path entirely
     store.close();
   });
 
-  it('(b) REST returns thin-front book → cancels for the REAL reason (verified=true, warn event)', async () => {
+  it('(b) Predict skips REST verify — thin front does NOT trigger cancel through REST path', async () => {
     const store = tempStore();
     const adapter = makeAdapter(async () => thinFrontBook());
     const svc = new CancelService(config, adapter, store);
@@ -184,15 +183,17 @@ describe('CancelService.cancelReplaceableOrders — REST verify before naked-res
       [makeMarket()],
       new Map()
     );
-    expect(result.canceledIds).toHaveLength(1);
+    // REST verify skipped for Predict — order flows to shouldRetreatThinFront.
+    // shouldRetreatThinFront returns null on no-book, order is kept.
+    expect(result.canceledIds).toHaveLength(0);
+    expect(adapter.getOrderbook).not.toHaveBeenCalled();
     const recents = (store as any).listRecentEvents(20);
     const verifiedCancelEvt = recents.find((e: any) => e.type === 'quote.protect-rest-verify-canceled');
-    expect(verifiedCancelEvt).toBeDefined();
-    expect(verifiedCancelEvt.severity).toBe('warn');
+    expect(verifiedCancelEvt).toBeUndefined();
     store.close();
   });
 
-  it('(c) REST throws → cancels (fallback to original behaviour, verified=false, info event)', async () => {
+  it('(c) Predict skips REST verify — REST exception does NOT trigger cancel', async () => {
     const store = tempStore();
     const adapter = makeAdapter(async () => { throw new Error('fetch failed'); });
     const svc = new CancelService(config, adapter, store);
@@ -206,16 +207,15 @@ describe('CancelService.cancelReplaceableOrders — REST verify before naked-res
       [makeMarket()],
       new Map()
     );
-    expect(result.canceledIds).toHaveLength(1);
+    expect(result.canceledIds).toHaveLength(0);
+    expect(adapter.getOrderbook).not.toHaveBeenCalled();
     const recents = (store as any).listRecentEvents(20);
     const failedEvt = recents.find((e: any) => e.type === 'quote.protect-rest-verify-failed');
-    expect(failedEvt).toBeDefined();
-    expect(failedEvt.severity).toBe('info');
-    expect(String(failedEvt.message)).toMatch(/REST 验证调用失败/);
+    expect(failedEvt).toBeUndefined();
     store.close();
   });
 
-  it('(d) REST times out → cancels (fallback, verified=false)', async () => {
+  it('(d) Predict skips REST verify — REST timeout does NOT trigger cancel', async () => {
     const store = tempStore();
     // never resolves
     const adapter = makeAdapter(() => new Promise(() => {/* hang */}));
@@ -230,14 +230,15 @@ describe('CancelService.cancelReplaceableOrders — REST verify before naked-res
       [makeMarket()],
       new Map()
     );
-    expect(result.canceledIds).toHaveLength(1);
+    expect(result.canceledIds).toHaveLength(0);
+    expect(adapter.getOrderbook).not.toHaveBeenCalled();
     const recents = (store as any).listRecentEvents(20);
     const failedEvt = recents.find((e: any) => e.type === 'quote.protect-rest-verify-failed');
-    expect(failedEvt).toBeDefined();
+    expect(failedEvt).toBeUndefined();
     store.close();
   }, 10000);
 
-  it('(e) adapter without getOrderbook → cancels (fallback, no crash)', async () => {
+  it('(e) Predict skips REST verify — adapter without getOrderbook, no crash', async () => {
     const store = tempStore();
     const adapter = makeAdapter(undefined);
     const svc = new CancelService(config, adapter, store);
@@ -251,7 +252,8 @@ describe('CancelService.cancelReplaceableOrders — REST verify before naked-res
       [makeMarket()],
       new Map()
     );
-    expect(result.canceledIds).toHaveLength(1);
+    expect(result.canceledIds).toHaveLength(0);
+    expect(adapter.getOrderbook).toBeUndefined();
     store.close();
   });
 
