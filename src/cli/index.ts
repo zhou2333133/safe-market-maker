@@ -243,7 +243,7 @@ program
 
 program
   .command('ui')
-  .option('--port <port>', 'local UI port', '8787')
+  .option('--port <port>', 'local UI port', '8789')
   .option('--host <host>', 'local UI host', '127.0.0.1')
   .option('--allow-remote-ui', 'allow binding the UI to a non-loopback host')
   .description('start the local web UI on 127.0.0.1')

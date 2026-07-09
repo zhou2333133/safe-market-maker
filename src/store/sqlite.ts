@@ -9,11 +9,13 @@ import { stateStoreSchemaSql } from './schema.js';
 import { configureForensicLog, forensicLogEvent, pruneOldForensicFiles } from '../observability/forensic-log.js';
 
 // Retention windows: events/metrics/orders(non-open)/account_risk_* in SQLite kept for 24h (SQLITE_RETENTION_MS; hot tier, queried by UI + audit), forensic JSONL on disk
-// kept for 3d (cold archive, post-hoc complete record). Production observed ~1.5GB/day forensic growth (POLY's
-// order.ws-update fires ~2.3k/min and dominates), so 3d ≈ 4.5GB on disk — comfortable. Original 30d was sized
-// against a 60MB/day estimate that's ~25x off. Both auto-pruned at store-open so a long-running bot self-maintains.
+// kept for 1d (cold archive, post-hoc complete record). Operator reviews every fill on demand, so a detailed trail
+// beyond 1 day is not needed and would only grow disk. Production observed ~1.5GB/day forensic growth (POLY's
+// order.ws-update fires ~2.3k/min and dominates), so 1d ≈ 1.5GB on disk — comfortable. Original 30d was sized
+// against a 60MB/day estimate that's ~25x off; 3d was an intermediate; 1d is the operator-chosen window. Both
+// auto-pruned at store-open so a long-running bot self-maintains.
 const SQLITE_RETENTION_MS = 24 * 60 * 60 * 1000;
-const FORENSIC_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+const FORENSIC_RETENTION_MS = 1 * 24 * 60 * 60 * 1000;
 
 let retentionTimer: ReturnType<typeof setInterval> | undefined;
 /**
@@ -49,6 +51,9 @@ export class StateStore {
     this.orders = new OrderLedgerRepository(this.db);
     this.risks = new RiskRepository(this.db, this.observability);
     this.db.pragma('journal_mode = WAL');
+    // Avoid SQLITE_BUSY when the 6h retention timer opens a second handle on the same WAL file: wait (and
+    // retry internally) up to 5s instead of throwing, so concurrent pruneRetention runs don't silently fail.
+    this.db.pragma('busy_timeout = 5000');
     this.migrate();
     this.pruneRetention(path.dirname(dbPath));
   }
@@ -108,6 +113,11 @@ export class StateStore {
     }
   }
 
+  private bumpWriteError(): void {
+    this.consecutiveWriteErrors += 1;
+    this.lastWriteErrorAt = Date.now();
+  }
+
   recordEvent(input: {
     venue?: VenueName;
     severity?: 'info' | 'warn' | 'error';
@@ -117,10 +127,8 @@ export class StateStore {
   }): void {
     try {
       this.observability.recordEvent(input);
-      this.consecutiveWriteErrors = 0;
     } catch (err) {
-      this.consecutiveWriteErrors += 1;
-      this.lastWriteErrorAt = Date.now();
+      this.bumpWriteError();
       // Forensic log (JSONL file) is the belt-and-suspenders fallback — it never depends on SQLite.
     }
     forensicLogEvent(input);
@@ -129,6 +137,10 @@ export class StateStore {
   /** Returns true when the DB write path has been failing recently — the engine uses this to enter
    *  protect-only mode so no fresh orders are placed on stale data while the DB is down. */
   dbWriteDegraded(): boolean {
+    // Recover after a sustained quiet window: a write that succeeded long ago no longer implies the DB is sick.
+    if (this.consecutiveWriteErrors > 0 && Date.now() - this.lastWriteErrorAt >= 120_000) {
+      this.consecutiveWriteErrors = 0;
+    }
     return this.consecutiveWriteErrors >= 5 && Date.now() - this.lastWriteErrorAt < 120_000;
   }
 
@@ -151,7 +163,12 @@ export class StateStore {
   }
 
   recordOrderResult(result: OrderResult): void {
-    this.orders.recordOrderResult(result);
+    try {
+      this.orders.recordOrderResult(result);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   markPlannedOrderRejected(clientOrderId: string, reason: string, details: unknown = {}): void {
@@ -163,7 +180,12 @@ export class StateStore {
   }
 
   ingestOpenOrders(orders: OpenOrder[], mode: ExecutionMode): void {
-    this.orders.ingestOpenOrders(orders, mode);
+    try {
+      this.orders.ingestOpenOrders(orders, mode);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   reconcileOpenOrders(
@@ -172,11 +194,21 @@ export class StateStore {
     mode: ExecutionMode,
     options: { freshOpenGraceMs?: number } = {}
   ): void {
-    this.orders.reconcileOpenOrders(venue, remoteOrders, mode, options);
+    try {
+      this.orders.reconcileOpenOrders(venue, remoteOrders, mode, options);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   markOrdersCanceled(venue: VenueName, orderIds: string[]): void {
-    this.orders.markOrdersCanceled(venue, orderIds);
+    try {
+      this.orders.markOrdersCanceled(venue, orderIds);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   markStalePendingOpenOrdersCanceled(venue: VenueName, olderThanMs?: number): void {
@@ -230,17 +262,32 @@ export class StateStore {
   }
 
   recordAccountRiskSnapshot(snapshot: AccountRiskSnapshot): void {
-    this.risks.recordAccountRiskSnapshot(snapshot);
+    try {
+      this.risks.recordAccountRiskSnapshot(snapshot);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   /** Insert a fill the venue WS user channel just pushed; idempotent on (venue, fill_id). See
    *  RiskRepository.recordWsFill for the WS-vs-REST dual-source semantics. */
   recordWsFill(row: import('./risk-repository.js').WsFillRow): void {
-    this.risks.recordWsFill(row);
+    try {
+      this.risks.recordWsFill(row);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   recordAccountRiskDecision(decision: AccountRiskDecision): void {
-    this.risks.recordAccountRiskDecision(decision);
+    try {
+      this.risks.recordAccountRiskDecision(decision);
+    } catch (err) {
+      this.bumpWriteError();
+      throw err;
+    }
   }
 
   getLatestAccountRiskDecision(venue: VenueName): (AccountRiskDecision & { ts: string }) | undefined {

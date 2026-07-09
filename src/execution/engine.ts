@@ -21,6 +21,7 @@ import { SplitEntryService } from './split-entry-service.js';
 import { accountRiskWindowStart } from '../risk/risk-window.js';
 import { evaluateAccountRisk } from '../risk/account-risk.js';
 import { PolymarketUserStreamHandler } from './polymarket-user-stream-handler.js';
+import { forensicLog } from '../observability/forensic-log.js';
 
 const CASH_NEW_ORDER_PAUSE_CHECKPOINT_PREFIX = 'cash-new-order-pause';
 const KILL_EXIT_MAX_ATTEMPTS = 8;
@@ -39,6 +40,9 @@ const wsDisconnectedSince = new Map<VenueName, number>();
 const USER_WS_GRACE_MS = 30_000;
 const USER_WS_TIMEOUT_MS = 600_000;
 const userWsDisconnectedSince = new Map<VenueName, number>();
+// Protect-path forensic logging: collapse consecutive identical judgments for the same (venue, tokenId) within
+// this window so the cold archive stays readable and bounded while still capturing every state transition.
+const PROTECT_LOG_DEDUP_MS = 30_000;
 
 export interface RunOnceOptions {
   venue: VenueName;
@@ -116,6 +120,9 @@ export class ExecutionEngine {
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
   // > cycleStartedAt, WS already cleared a position this cycle → skip placement to avoid re-pinning the token.
   private readonly lastWsProtectAt = new Map<VenueName, number>();
+  // Protect-path forensic throttle state: mapKey(venue:tokenId:result) -> { key, ts }. Entries are tiny and
+  // pruned opportunistically so a long-running bot doesn't accumulate unbounded dead state.
+  private readonly protectLogThrottle = new Map<string, { key: string; ts: number }>();
 
   constructor(
     private readonly config: AppConfig,
@@ -545,6 +552,15 @@ export class ExecutionEngine {
     const routeSides = new Map(routeSelection.selected.map((candidate) => [candidate.market.tokenId, candidate.side] as const));
     const intents = this.strategy.buildIntents(options.venue, routedMarkets, books, { positions, openOrders, balances, routeSides });
     books = await this.marketDataSync.refreshOrderbooks(options.venue, intents.map((intent) => intent.market), books, { reuseFresh: reuseFreshRouteBooks });
+    // 取证：每轮刷新盘口后，对所有在挂 token 采样记录盘口阶梯（每 token 30s 一次）。
+    // 这样即使 WS 从不推该 token 盘口（零流动性市场），被吃前的近似盘口也可复盘。
+    // forensicLog 永不阻断执行；节流保证体积远低于原 1.5GB/天。
+    for (const o of openOrders) {
+      const bk = books.get(o.tokenId);
+      if (bk && this.shouldLogBook(options.venue, o.tokenId, 30_000)) {
+        forensicLog('book.snapshot', options.venue, { tokenId: o.tokenId, source: 'cycle', ...this.bookSnapshot(bk) });
+      }
+    }
     const replaceCancel = await this.cancelService.cancelReplaceableOrders(options.venue, openOrders, intents, monitoredMarkets, books, previousRouteTokenIds, {
       requireFreshReplacementForObsoleteCashOrders: routeSelection.switched && !isPairedEntryMode(this.config),
       deferObsoleteCancels: options.fast === true
@@ -865,17 +881,31 @@ export class ExecutionEngine {
       // the await blocked exit-flow timing in tests, and "missing snapshot" is itself diagnostic: it means WS
       // never had this book, which is exactly the symptom we now cancel for after 30s of naked rest).
       const bookSnapshots: Record<string, unknown> = {};
+      const restTokens: string[] = [];
       for (const pos of unexpected.positions) {
         try {
           const cached = this.adapter.getCachedOrderbook?.(pos.tokenId);
           if (cached) {
-            bookSnapshots[pos.tokenId] = {
-              receivedAt: cached.receivedAt,
-              bids: (cached.bids || []).slice(0, 10).map((b) => ({ price: b.price, size: b.size })),
-              asks: (cached.asks || []).slice(0, 10).map((a) => ({ price: a.price, size: a.size }))
-            };
+            bookSnapshots[pos.tokenId] = { ...this.bookSnapshot(cached), source: 'ws-cache' };
+          } else {
+            // WS 缓存无盘口（零流动性 token 常见：WS 从不推该 token 盘口）→ 退回 REST 抓实时盘口，
+            // 保证被吃时一定有盘口留证，而不是留空 {}。
+            restTokens.push(pos.tokenId);
           }
         } catch { /* best effort */ }
+      }
+      const getRest = this.adapter.getOrderbookRest;
+      if (restTokens.length > 0 && getRest) {
+        const results = await Promise.all(
+          restTokens.map(async (tid) => {
+            try { return [tid, await getRest(tid)] as const; }
+            catch { return [tid, undefined] as const; }
+          })
+        );
+        for (const [tid, bk] of results) {
+          if (bk) bookSnapshots[tid] = { ...this.bookSnapshot(bk), source: 'rest-fallback' };
+          else bookSnapshots[tid] = { receivedAt: 0, source: 'unavailable', note: 'WS 缓存为空且 REST 兜底失败' };
+        }
       }
       this.store.recordEvent({
         venue,
@@ -1059,6 +1089,42 @@ export class ExecutionEngine {
    * rejection would crash the Node process. Until a cycle has captured a signer (lastSigner unset), the call
    * silently no-ops because no WS fills can arrive before the venue has authenticated anyway.
    */
+
+  private readonly bookLogThrottle = new Map<string, number>();
+
+  /** Throttle helper for low-frequency forensic book snapshots (e.g. one per token per 30s). */
+  private shouldLogBook(venue: VenueName, tokenId: string, minMs: number): boolean {
+    const key = `${venue}:${tokenId}`;
+    const now = Date.now();
+    const last = this.bookLogThrottle.get(key) ?? 0;
+    if (now - last < minMs) return false;
+    this.bookLogThrottle.set(key, now);
+    return true;
+  }
+
+  /** Compact top-of-book ladder for forensic replay (bids/asks top 10 + receivedAt). */
+  private bookSnapshot(book: Orderbook): { receivedAt: number; bids: Array<{ price: number; size: number }>; asks: Array<{ price: number; size: number }> } {
+    return {
+      receivedAt: book.receivedAt ?? 0,
+      bids: (book.bids || []).slice(0, 10).map((b) => ({ price: b.price, size: b.size })),
+      asks: (book.asks || []).slice(0, 10).map((a) => ({ price: a.price, size: a.size }))
+    };
+  }
+
+  private logProtectJudgment(venue: VenueName, tokenId: string, key: string, data: Record<string, unknown>): void {
+    const mapKey = `${venue}:${tokenId}:${key}`;
+    const now = Date.now();
+    const prev = this.protectLogThrottle.get(mapKey);
+    if (prev && prev.key === key && now - prev.ts < PROTECT_LOG_DEDUP_MS) return;
+    this.protectLogThrottle.set(mapKey, { key, ts: now });
+    if (this.protectLogThrottle.size > 4000) {
+      for (const [k, v] of this.protectLogThrottle) {
+        if (now - v.ts > 300_000) this.protectLogThrottle.delete(k);
+      }
+    }
+    forensicLog('protect-judgment', venue, { tokenId, result: key, ...data });
+  }
+
   async protectOnFill(venue: VenueName, tokenId: string, fillSize: number, fillPrice: number): Promise<void> {
     // Per-(venue, tokenId) dedupe — multiple partial fills on the same token collapse to ONE protect task.
     // Uses the FILL-specific Map, separate from A-3's book-update dedupe so we never silently skip a stop-loss
@@ -1144,6 +1210,16 @@ export class ExecutionEngine {
         markets
       });
 
+      // Cold-archive anchor for "why was this fill not prevented": mark the fill so a post-hoc review can
+      // grep forensic for this token's a3/p1 protect-judgment trail within the 1d window.
+      forensicLog('fill-rootcause', venue, {
+        tokenId,
+        fillSize,
+        fillPrice,
+        notionalUsd: fillSize * fillPrice,
+        note: 'fill detected; grep forensic for a3/p1 protect-judgment of this token within the 1d window'
+      });
+
       this.store.recordEvent({
         venue,
         severity: 'warn',
@@ -1191,15 +1267,35 @@ export class ExecutionEngine {
       // Find this token's managed BUY orders (the only kind shouldRetreatThinFront acts on). If none, the
       // book update is irrelevant to us — return silently. This is the hot path: 99% of book updates land
       // on tokens we either don't quote or have no resting order on.
-      const managed = this.store.listManagedOpenOrders(venue)
-        .filter((order) => order.tokenId === tokenId && order.status === 'OPEN' && order.side === 'BUY');
+      // P0: listManagedOpenOrders 读本地 SQLite。若连接断开，该调用抛错导致整条实时保护链死亡。
+      // 降级走 REST 开放订单接口，store 不可用时 A-3 仍存活。
+      let managed: OpenOrder[];
+      try {
+        managed = this.store.listManagedOpenOrders(venue);
+      } catch {
+        const signerAddress = this.lastSignerAddress;
+        if (signerAddress) {
+          try {
+            managed = (await this.adapter.getOpenOrders(signerAddress))
+              .filter((o) => o.tokenId === tokenId && o.status === 'OPEN' && o.side === 'BUY');
+          } catch {
+            managed = [];
+          }
+        } else {
+          managed = [];
+        }
+      }
+      managed = managed.filter((order) => order.tokenId === tokenId && order.status === 'OPEN' && order.side === 'BUY');
       if (managed.length === 0) return;
 
       // Read the just-updated book straight from the WS push cache (zero-cost). If the adapter doesn't
       // expose getCachedOrderbook OR the cache miss-fired (e.g. just primed but not pushed), skip — the
       // cycle's REST verify path will catch it.
       const book = this.adapter.getCachedOrderbook?.(tokenId);
-      if (!book) return;
+      if (!book) {
+        this.logProtectJudgment(venue, tokenId, 'a3-book-cache-miss', {});
+        return;
+      }
 
       // Need the Market metadata for the retreat check (carries tickSize, reward shape).
       // Sync cache-only read — never triggers a REST fetch. Cache miss means the cycle hasn't

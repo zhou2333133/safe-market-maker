@@ -132,6 +132,9 @@ function isOriginAllowed(req: IncomingMessage, serverInfo: { host: string; port:
     } catch { return false; }
   };
   if (!origin && !referer) {
+    // 绑定到非回环地址时，绝不信任 Host 头（远程客户端可伪造任意 Host）；必须携带真实 Origin/Referer。
+    // 回环绑定保持原行为。
+    if (!LOOPBACK_HOSTS.has(serverInfo.host)) return false;
     return loopbackHostAllowed(extractHostname(String(req.headers['host'] ?? '')));
   }
   if (origin) {
@@ -149,9 +152,15 @@ function isOriginAllowed(req: IncomingMessage, serverInfo: { host: string; port:
 
 export async function startUiServer(configPath: string, options: UiServerOptions = {}): Promise<UiServerHandle> {
   const host = options.host ?? '127.0.0.1';
-  const port = options.port ?? 8787;
+  const port = options.port ?? 8789;
   if (!LOOPBACK_HOSTS.has(host) && !options.allowRemote) {
     throw new Error('UI 默认只允许绑定 127.0.0.1；如果确认风险，使用 --allow-remote-ui。');
+  }
+  if (options.allowRemote) {
+    logger.warn(
+      'SECURITY: WebUI 已绑定到非回环地址 (--allow-remote-ui)。该端口暴露后任何能访问者均可尝试操作机器人；' +
+      '请确保网络受控（VPN 或带鉴权的反向代理），且敏感操作仍需密码。'
+    );
   }
   const loaded = loadConfig(configPath);
   ensureDataDirs(loaded.dataDir);
@@ -303,12 +312,21 @@ function startLoopStaleWatchdog(dataDir: string, liveLoops: LiveLoops): NodeJS.T
             lastAlertedAt.delete(venue);
             continue;
           }
-          // Intentional-stop guard: if the loop was deliberately halted (risk-stop / user-stop), a stale cycle is
-          // by-design — restoreLiveLoops never auto-resumes these, so the error below would be a FALSE alarm that
-          // hides the real to-do (manual recovery in the UI). Downgrade to a single info event and skip auto-recovery.
+          // Intentional-stop guard: if the loop was deliberately halted (risk-stop / user-stop / user-stop-and-cancel),
+          // a stale cycle is by-design — restoreLiveLoops never auto-resumes these, so the error below would be a
+          // FALSE alarm that hides the real to-do (manual recovery in the UI). Downgrade to a single info event and
+          // skip auto-recovery.
+          // The dedicated live-stop intent file is the reliable source of truth: all three stop paths write it with a
+          // proper `source`, whereas the `stage.*` checkpoint carries no source. Prefer the intent, fall back to stage.
           const stageCp = store.getCheckpoint('stage.' + venue);
           const stageVal = stageCp?.value as { stage?: string; source?: string } | undefined;
-          if (stageVal && (stageVal.source === 'risk-stop' || stageVal.source === 'user-stop')) {
+          let intentionalSource: string | undefined = stageVal?.source;
+          try {
+            const { readLiveStopIntent } = await import('./live-intent.js');
+            const stopIntent = readLiveStopIntent(dataDir, venue);
+            if (stopIntent?.source) intentionalSource = stopIntent.source;
+          } catch { /* ignore */ }
+          if (intentionalSource === 'risk-stop' || intentionalSource === 'user-stop' || intentionalSource === 'user-stop-and-cancel') {
             const lastInfoMs = lastIntentionalStopInfoAt.get(venue) ?? 0;
             if (now - lastInfoMs >= LOOP_STALE_THRESHOLD_MS) {
               lastIntentionalStopInfoAt.set(venue, now);
@@ -316,8 +334,8 @@ function startLoopStaleWatchdog(dataDir: string, liveLoops: LiveLoops): NodeJS.T
                 venue,
                 severity: 'info',
                 type: 'loop-stale-intentional-stop',
-                message: `${venue} 实盘循环为主动停止（source=${stageVal.source}），非卡死，无需处理`,
-                details: { lastCycleAt: lastCycle, stalenessMs, source: stageVal.source }
+                message: `${venue} 实盘循环为主动停止（source=${intentionalSource}），非卡死，无需处理`,
+                details: { lastCycleAt: lastCycle, stalenessMs, source: intentionalSource }
               });
             }
             continue;

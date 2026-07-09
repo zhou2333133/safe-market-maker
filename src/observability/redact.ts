@@ -1,5 +1,5 @@
-const SENSITIVE_KEY_RE = /(private.?key|secret|passphrase|password|jwt|api.?key|authorization|signature|^token$|(^|[_-])(access|auth|refresh|id)[_-]?token$|token[_-]?(secret|value)$)/i;
-const PUBLIC_TOKEN_KEY_RE = /^(tokenId|token_id|tokenIds|token_ids|clobTokenIds|clob_token_ids|tokenAddress|token_address)$/i;
+export const SENSITIVE_KEY_RE = /(private.?key|secret|passphrase|password|jwt|api.?key|authorization|signature|^token$|(^|[_-])(access|auth|refresh|id)[_-]?token$|token[_-]?(secret|value)$)/i;
+export const PUBLIC_TOKEN_KEY_RE = /^(tokenId|token_id|tokenIds|token_ids|clobTokenIds|clob_token_ids|tokenAddress|token_address)$/i;
 const HEX_PRIVATE_KEY_RE = /\b(0x)?[a-fA-F0-9]{64}\b/g;
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._+=/-]{12,}\b/gi;

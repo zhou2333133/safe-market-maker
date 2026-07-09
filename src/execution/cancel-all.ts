@@ -75,8 +75,33 @@ export async function cancelAllLiveOrders(input: CancelAllLiveOrdersInput): Prom
   const remote = await input.adapter.getOpenOrders(input.signer.address);
   input.store.reconcileOpenOrders(input.venue, remote, 'live');
   const ids = [...new Set(remote.map((order) => order.externalId).filter(Boolean))];
-  await input.adapter.cancelOrders(ids);
-  input.store.markOrdersCanceled(input.venue, ids);
+  if (ids.length > 0) {
+    // Retry the cancel a few times — a single transient RPC error must not leave orders resting.
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await input.adapter.cancelOrders(ids);
+        lastError = undefined;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt + 1 < 3) await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    if (lastError) {
+      input.store.recordEvent({
+        venue: input.venue,
+        severity: 'error',
+        type: `${eventType}.cancel-failed`,
+        message: `紧急撤单重试 3 次仍失败，仍有 ${ids.length} 个订单未被撤掉，需人工复查`,
+        details: { ids, lastError: lastError instanceof Error ? lastError.message : String(lastError) }
+      });
+    }
+    // Mark every attempted id as CANCELED in the local ledger. In production a successful cancel removes the
+    // order from the exchange, so the optimistic mark is correct; a total exchange-side failure is already
+    // flagged above for manual reconciliation rather than silently left resting.
+    input.store.markOrdersCanceled(input.venue, ids);
+  }
   input.store.recordEvent({
     venue: input.venue,
     severity: 'warn',

@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { SENSITIVE_KEY_RE, PUBLIC_TOKEN_KEY_RE } from './redact.js';
 
 /**
  * Backend-only forensic log. Writes a full-fidelity, daily-rotated JSONL audit trail under <dataDir>/forensic/ that is
@@ -15,7 +16,55 @@ let forensicDir: string | undefined;
 
 // Highest-frequency, lowest-signal events are dropped so the meaningful trail (fills, exits, rejects, risk gates,
 // replaces, errors) isn't buried. Everything else — including exit-blocked thrashing — is kept.
-const NOISY_EVENT_TYPES = new Set(['quote.skip-existing', 'quote.final-repriced']);
+// 'order.ws-update' dominates forensic volume (~2.3k/min, ~1.5GB/day) but is best-effort observability only
+// (polymarket-user-stream-handler.ts) — order state is already durably captured in the orders ledger
+// (REST-synced size_matched) and fill events, and the UI events table already throttles it. Dropping it from
+// the cold archive cuts daily volume to tens of MB. Book ladders are instead captured where they actually
+// matter for replay — at fill-detection (engine.ts: fill-circuit-breaker.triggered orderbookSnapshots, with a
+// REST fallback so zero-liquidity tokens aren't left blank), per-cycle sampled (forensic kind 'book.snapshot'),
+// and on each a3-safe/p1-safe judgment — so "what did the book look like when this got eaten" stays answerable
+// without the 1.5GB/day firehose.
+const NOISY_EVENT_TYPES = new Set(['quote.skip-existing', 'quote.final-repriced', 'order.ws-update']);
+
+/**
+ * Forensic-specific redaction. Unlike the generic `redact()` (used for API error responses), this does NOT
+ * run the string-level 64-hex / JWT / Bearer regexes. Reason: a Polymarket `tokenId` is itself a 64-hex
+ * string, so the generic string redactor would blank it out and break post-hoc `grep <tokenId>` replay.
+ * Here we redact ONLY by sensitive KEY name (privateKey, secret, passphrase, signature, apiKey, ...) and
+ * explicitly preserve tokenId / tokenAddress (the replay keys). Free-text strings (e.g. event `message`)
+ * are left intact so timelines stay greppable. This keeps real secrets out of the cold archive without
+ * harming forensics.
+ */
+function redactForensicValue(value: unknown, seen: WeakSet<object>): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    const out = value.map((item) => redactForensicValue(item, seen));
+    seen.delete(value);
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (PUBLIC_TOKEN_KEY_RE.test(key)) {
+        out[key] = item; // 复盘钥匙：原样保留
+      } else if (SENSITIVE_KEY_RE.test(key)) {
+        out[key] = '[REDACTED]';
+      } else {
+        out[key] = redactForensicValue(item, seen);
+      }
+    }
+    seen.delete(value);
+    return out;
+  }
+  return value; // 字符串/数字/布尔/null：绝不按字符串扫描，保住自由文本中的 tokenId
+}
+
+function redactForensic(value: unknown): Record<string, unknown> {
+  return redactForensicValue(value, new WeakSet<object>()) as Record<string, unknown>;
+}
 
 /** Point the forensic log at <dataDir>/forensic/. Safe to call repeatedly (e.g. each store open). */
 export function configureForensicLog(dataDir: string): void {
@@ -40,7 +89,7 @@ export function forensicLog(kind: string, venue: string | undefined, data: Recor
   if (!file) return;
   try {
     const ts = Date.now();
-    appendFileSync(file, JSON.stringify({ ts, iso: new Date(ts).toISOString(), kind, venue, ...data }) + '\n');
+    appendFileSync(file, JSON.stringify({ ts, iso: new Date(ts).toISOString(), kind, venue, ...redactForensic(data) }) + '\n');
   } catch {
     /* forensic logging must never break the bot */
   }

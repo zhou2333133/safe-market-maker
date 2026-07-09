@@ -301,6 +301,21 @@ export function normalizeLevels(levels: any[], side: 'bids' | 'asks'): Orderbook
 export function buildOrderbook(venue: VenueName, tokenId: string, payload: any): Orderbook {
   const bids = normalizeLevels(Array.isArray(payload?.bids) ? payload.bids : [], 'bids');
   const asks = normalizeLevels(Array.isArray(payload?.asks) ? payload.asks : [], 'asks');
+  // saneBook guard (mirrors polymarket-ws sanity check): reject malformed REST books so they can't drive
+  // quoting on bad data. A book with only one side still present is usable (e.g. quoting a cash BUY only
+  // needs bids), so we only reject a book that has NEITHER side, or a crossed book (best bid >= best ask).
+  const hasBids = bids.length > 0;
+  const hasAsks = asks.length > 0;
+  if (!hasBids && !hasAsks) {
+    return { venue, tokenId, bids: [], asks: [], receivedAt: Date.now() };
+  }
+  if (hasBids && hasAsks) {
+    const bestBid = bids[0]?.price;
+    const bestAsk = asks[0]?.price;
+    if (bestBid === undefined || bestAsk === undefined || !(bestBid > 0 && bestAsk < 1 && bestBid < bestAsk)) {
+      return { venue, tokenId, bids: [], asks: [], receivedAt: Date.now() };
+    }
+  }
   return {
     venue,
     tokenId,

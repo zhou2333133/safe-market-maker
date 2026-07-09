@@ -251,15 +251,24 @@ export function normalizePolymarketOpenOrder(order: any): OpenOrder | undefined 
   if (!externalId || !tokenId || !side) return undefined;
   const originalSize = toOptionalFiniteNumber(order?.original_size, order?.originalSize);
   const matchedSize = toOptionalFiniteNumber(order?.size_matched, order?.sizeMatched, order?.matched);
-  const remainingSize = toOptionalFiniteNumber(order?.size, order?.remaining_size, order?.remainingSize)
-    ?? (originalSize !== undefined ? Math.max(0, originalSize - (matchedSize ?? 0)) : 0);
+  const rawRemaining = toOptionalFiniteNumber(order?.size, order?.remaining_size, order?.remainingSize);
+  let size: number | undefined = rawRemaining;
+  if (size === undefined) {
+    if (originalSize !== undefined) {
+      size = Math.max(0, originalSize - (matchedSize ?? 0));
+    } else {
+      // Size unknown (no remaining/original/matched reported): do NOT synthesize a 0-sized OPEN order,
+      // which the protection logic would treat as a real resting position. Skip this order instead.
+      return undefined;
+    }
+  }
   return {
     venue: 'polymarket',
     externalId,
     tokenId,
     side,
     price: toFiniteNumber(order?.price),
-    size: Number(remainingSize.toFixed(4)),
+    size: Number(size.toFixed(4)),
     status: 'OPEN',
     raw: order
   };

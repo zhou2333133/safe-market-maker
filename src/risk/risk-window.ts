@@ -12,5 +12,8 @@ export function accountRiskWindowStart(
   const startedAt = (checkpoint as { startedAt?: unknown }).startedAt;
   if (typeof startedAt !== 'string') return fallback;
   const ts = Date.parse(startedAt);
-  return Number.isFinite(ts) ? ts : fallback;
+  // Clamp to at least today's midnight: a session that started before midnight must not extend the
+  // daily-loss window into the previous day (would under-count today's realized loss). Math.max keeps the
+  // later of (session start, today 00:00) as the window boundary.
+  return Number.isFinite(ts) ? Math.max(ts, fallback) : fallback;
 }
