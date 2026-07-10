@@ -120,10 +120,10 @@ export class ExecutionEngine {
   private static readonly RETREAT_COOLDOWN_MS = 120_000;
   // 盲区 REST 辅助扫描（仅 Predict）常量。WS 主路径(A-3)只在 server 推送盘口时触发；对 server 静默的低流动性
   // /深处挂单 token，A-3 完全失明。以下常量驱动 REST 兜底核验的频率与阈值（用户已确认：沉默 20s、REST 连失败 3 次、
-  // 低频复核 60s）。
+  // 低频复核 20s）。
   private static readonly BLIND_SWEEP_MS = 10_000;          // 扫描自身频率门控：每 10s 至多执行一次 REST 核验
   private static readonly BLIND_SILENCE_MS = 20_000;        // 疑似盲区阈值：WS 沉默 >= 20s 才视为可疑
-  private static readonly BLIND_REST_REVERIFY_MS = 60_000;  // 低频复核：REST 确认安全后 60s 内不再重复 REST
+  private static readonly BLIND_REST_REVERIFY_MS = 20_000;  // 低频复核：REST 确认安全后 20s 内不再重复 REST
   private static readonly BLIND_MIN_ORDER_AGE_MS = 30_000;  // 订单太新不误判：挂单 < 30s 给 WS 首次推送留时间
   private static readonly BLIND_REST_FAIL_STRIKES = 3;      // REST 连续失败 3 次才撤退（温和重试，不凭空撤）
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
