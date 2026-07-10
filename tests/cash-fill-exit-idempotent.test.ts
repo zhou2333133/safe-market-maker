@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CashFillExitService } from '../src/execution/cash-fill-exit-service.js';
+import { CashFillExitService, isMaterialCashPosition } from '../src/execution/cash-fill-exit-service.js';
 import { appConfigSchema } from '../src/config/schema.js';
 import type { Market, Orderbook, Position, OrderResult } from '../src/domain/types.js';
 
@@ -220,6 +220,37 @@ describe('CashFillExitService — idempotent exits (Bug C fix)', () => {
     expect(adapter.createMarketableOrder).toHaveBeenCalledTimes(1); // still 1
     expect(r2.blocked).toBe(1);
     expect(r2.failed).toBe(0);
+  });
+});
+
+describe('isMaterialCashPosition — cashIgnorePositionTokenIds', () => {
+  it('treats an explicitly ignored token as non-material (other tokens unchanged)', () => {
+    const cfg = appConfigSchema.parse({
+      strategy: {
+        entryMode: 'cash',
+        cashIgnorePositionTokenIds: ['tokIgnore']
+      }
+    });
+    const ignored: Position = {
+      venue: 'predict',
+      tokenId: 'tokIgnore',
+      size: 1556.4,
+      averagePrice: 0.0049,
+      notionalUsd: 7.6,
+      marketId: '718749',
+      outcome: 'No'
+    } as any;
+    const other: Position = {
+      venue: 'predict',
+      tokenId: 'tokOther',
+      size: 100,
+      averagePrice: 0.4,
+      notionalUsd: 40,
+      marketId: '1',
+      outcome: 'Yes'
+    } as any;
+    expect(isMaterialCashPosition(cfg, ignored)).toBe(false);
+    expect(isMaterialCashPosition(cfg, other)).toBe(true);
   });
 });
 

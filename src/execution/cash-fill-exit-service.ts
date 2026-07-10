@@ -470,12 +470,22 @@ function cashExitPositions(config: AppConfig, positions: Position[], venue: Venu
 }
 
 export function isMaterialCashPosition(config: AppConfig, position: Position): boolean {
+  // Explicit operator ignore list (illiquid stuck inventory). Checked first so fill-circuit-breaker,
+  // cash-exit, and kill-exit all skip the same tokens without per-call-site duplication.
+  if (isCashIgnoredPositionToken(config, position.tokenId)) return false;
   const minSize = Math.max(0, config.strategy.minPositionSizeToLiquidate ?? 0.0001);
   const size = Math.abs(position.size);
   const notional = cashPositionNotionalUsd(position);
   if (notional > CASH_DUST_NOTIONAL_USD) return true;
   if (notional > EPSILON || hasKnownPositionPrice(position)) return false;
   return size > minSize;
+}
+
+/** True when strategy.cashIgnorePositionTokenIds lists this token (operator-approved stuck inventory). */
+export function isCashIgnoredPositionToken(config: AppConfig, tokenId: string): boolean {
+  const list = config.strategy.cashIgnorePositionTokenIds;
+  if (!list || list.length === 0) return false;
+  return list.includes(tokenId);
 }
 
 function cashPositionNotionalUsd(position: Position): number {

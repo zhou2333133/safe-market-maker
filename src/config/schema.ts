@@ -94,6 +94,11 @@ const strategySchema = z.object({
   onFillAction: z.enum(['hold', 'sellAllAtMarket']).default('hold'),
   cashOnFillAction: z.enum(['hold', 'sellWithinLossCap']).default('hold'),
   cashMaxExitLossPct: z.number().min(0).max(100).default(30),
+  // Operator escape hatch: tokenIds listed here are treated as non-material for cash fill-circuit /
+  // cash-exit / kill-exit. Use only for illiquid junk inventory that cannot be exited and would
+  // otherwise permanently block new maker quotes. Does NOT clear the on-chain position — only
+  // stops the bot from treating it as an active cash-fill incident. Empty = no ignores.
+  cashIgnorePositionTokenIds: z.array(z.string().min(1)).default([]),
   liquidationSlippageTicks: z.number().int().min(0).default(2),
   liquidationMaxSlippageCents: z.number().positive().default(10),
   minPositionSizeToLiquidate: z.number().positive().default(0.0001),
