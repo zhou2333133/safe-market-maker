@@ -22,6 +22,7 @@ import { accountRiskWindowStart } from '../risk/risk-window.js';
 import { evaluateAccountRisk } from '../risk/account-risk.js';
 import { PolymarketUserStreamHandler } from './polymarket-user-stream-handler.js';
 import { forensicLog } from '../observability/forensic-log.js';
+import { bestBidAsk } from '../venues/normalize.js';
 
 const CASH_NEW_ORDER_PAUSE_CHECKPOINT_PREFIX = 'cash-new-order-pause';
 const KILL_EXIT_MAX_ATTEMPTS = 8;
@@ -1434,12 +1435,13 @@ export class ExecutionEngine {
      * WS 主路径(A-3)只在 server 推送盘口时触发；对 server 静默的低流动性/深处挂单 token，A-3 完全失明。
      * 本扫描针对"沉默 >= BLIND_SILENCE_MS 且无近期 REST 安全确认"的受管现金 BUY 单，用 REST 兜底核验：
      *   - Type A: 从未拿到过盘口(everHadBook=false) 且 REST 连失败 BLIND_REST_FAIL_STRIKES 次 → 撤（真裸单）
-     *   - Type B: REST 盘口显示前方塌陷 → shouldRetreatThinFront 撤退
-     *   - Type C: REST 与最后已知盘口一致（良性沉默）→ 保留 + 记录 lastRestSafeAt
-     *   - Type D: 曾拿到盘口(everHadBook=true) 但 REST 连失败 BLIND_REST_FAIL_STRIKES 次 → 保守撤（盲区窗口封顶）
-     * 温和重试：REST 失败不立即撤，保留最后已知盘口(everHadBook=true 时)，下个扫描周期重验；连失败封顶才撤。
-     * 频率门控：每 BLIND_SWEEP_MS 至多一次；沉默 < BLIND_SILENCE_MS 跳过(A-3 实时覆盖)；最近 BLIND_REST_REVERIFY_MS
-     * 内已 REST 确认安全则跳过(低频复核)。仅 Predict：两市场模块完全独立，Polymarket 不走此路径。
+     *   - Type B: REST 盘口显示前方/后方保护塌陷 → shouldRetreatThinFront 撤退
+     *   - Type C: REST 安全（良性沉默）→ 保留 + 记录 lastRestSafeAt
+     *   - Type D: 曾拿到盘口(everHadBook=true) 但 REST 连失败 BLIND_REST_FAIL_STRIKES 次 → 保守撤
+     *   - Type E: REST 返回空盘/缺 BBO → 立即撤（不可监督，禁止裸奔；与「空盘不挂」对称）
+     * 温和重试：REST 失败不立即撤，连失败封顶才撤；空盘不重试。
+     * 撤后写入 retreatedAt（RETREAT_COOLDOWN_MS）→ filterRetreatCooldown 跳过重挂。
+     * 仅 Predict：两市场模块完全独立，Polymarket 不走此路径。
      */
     private async sweepBlindSpotCashBuys(): Promise<void> {
       const venue = this.adapter.name;
@@ -1511,7 +1513,21 @@ export class ExecutionEngine {
           }
           continue;
         }
-        // REST 成功：清除失败计数，标记 everHadBook
+        // Type E: REST 返回空盘/缺 BBO — 不可监督，立即撤（不重试、不计入「安全」）
+        // 与 market-guard 挂单前 missing-bbo 对称：空盘不挂、已挂必撤。
+        if (isUnusableOrderbook(restBook)) {
+          failStrikes.set(tokenId, 0);
+          restSafe.delete(tokenId);
+          toCancel.push(order.externalId);
+          reasons.push({
+            orderId: order.externalId,
+            tokenId,
+            reason: '盲区 Type E: REST 返回空盘或缺少 BBO，盘口不可监督，立即撤退（空盘禁止挂单）'
+          });
+          this.logProtectJudgment(venue, tokenId, 'blind-empty-book', {});
+          continue;
+        }
+        // REST 成功且可用：清除失败计数，标记 everHadBook
         failStrikes.set(tokenId, 0);
         hadBook.add(tokenId);
         const market = this.marketDataSync.getMarketFromCache(venue, tokenId);
@@ -1522,12 +1538,12 @@ export class ExecutionEngine {
         }
         const retreat = shouldRetreatThinFront(this.config, venue, order, market, restBook);
         if (retreat) {
-          // Type B: REST 盘口塌陷
+          // Type B: REST 盘口塌陷（前深/后方退出流动性/档位）
           toCancel.push(order.externalId);
           reasons.push({
             orderId: order.externalId,
             tokenId,
-            reason: `盲区 Type B: REST 核验发现前方塌陷（${formatRetreatReasons(retreat)}），即时撤退`
+            reason: `盲区 Type B: REST 核验发现保护失效（${formatRetreatReasons(retreat)}），即时撤退`
           });
         } else {
           // Type C: 良性沉默
@@ -1584,6 +1600,21 @@ export class ExecutionEngine {
       this.bookFailStrikes.get(venue)?.delete(tokenId);
     }
 }
+/**
+ * Predict 盲区/挂单共用：盘口是否「可监督」。
+ * 缺 book、或缺 bid/ask 任一侧（无 BBO）→ 不可用。
+ * 挂单前 market-guard 已用 missing-bbo 禁挂；此处给 F8 撤已挂单与 Type E 用。
+ * 仅作纯函数，不碰 venue 配置，两 venue 代码路径各自决定是否调用。
+ */
+export function isUnusableOrderbook(book: Orderbook | undefined | null): boolean {
+  if (!book) return true;
+  const bids = book.bids ?? [];
+  const asks = book.asks ?? [];
+  if (bids.length === 0 || asks.length === 0) return true;
+  const bbo = bestBidAsk(book);
+  return bbo.bestBid === undefined || bbo.bestAsk === undefined;
+}
+
 function cashFillCircuitBreakerState(value: unknown): { active: boolean; positionFingerprint?: string; triggeredAt?: string } {
   if (!value || typeof value !== 'object') return { active: false };
   const state = value as { active?: unknown; positionFingerprint?: unknown; triggeredAt?: unknown };

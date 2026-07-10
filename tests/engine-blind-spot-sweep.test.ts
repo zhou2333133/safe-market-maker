@@ -224,6 +224,33 @@ describe('ExecutionEngine.sweepBlindSpotCashBuys (盲区 REST 辅助扫描, 仅 
     }));
   });
 
+  it('Type E: REST 返回空盘（无 BBO）→ 立即撤退，不重试', async () => {
+    const adapter = stubPredictAdapter(() => makeBook({
+      tokenId: 'tokA',
+      bids: [],
+      asks: []
+    }));
+    const { engine, store } = makeEngine(adapter);
+    overrideOrders(store, [makeCashBuyOrder('tokA', 'ext1', 0.40)]);
+    seedBookSeen(engine, 'tokA', 30_000);
+
+    const eventSpy = vi.spyOn(store, 'recordEvent');
+    await callSweep(engine);
+
+    expect(adapter.cancelOrders).toHaveBeenCalledTimes(1);
+    expect(adapter.cancelOrders).toHaveBeenCalledWith(['ext1']);
+    expect(eventSpy).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'quote.blind-spot-retreat',
+      details: expect.objectContaining({
+        reasons: expect.arrayContaining([expect.objectContaining({ reason: expect.stringContaining('Type E') })])
+      })
+    }));
+    // 冷却写入 retreatedAt，防止立刻回挂
+    const retreated = (engine as unknown as { retreatedAt: Map<string, Map<string, number>> })
+      .retreatedAt.get('predict')!.get('tokA')!;
+    expect(retreated).toBeGreaterThan(0);
+  });
+
   it('频率门控: 沉默 < 20s (近期有 WS 推送) → 跳过 REST, 不撤', async () => {
     const restSpy = vi.fn(() => makeBook({ tokenId: 'tokA', bids: [{ price: 0.41, size: 100 }] }));
     const adapter = stubPredictAdapter(restSpy);
