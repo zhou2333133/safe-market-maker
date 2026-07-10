@@ -117,12 +117,27 @@ export class ExecutionEngine {
   // retreated at 05:50:55, re-placed at 05:52:13, eaten 43s later).
   private readonly retreatedAt = new Map<VenueName, Map<string, number>>();
   private static readonly RETREAT_COOLDOWN_MS = 120_000;
+  // 盲区 REST 辅助扫描（仅 Predict）常量。WS 主路径(A-3)只在 server 推送盘口时触发；对 server 静默的低流动性
+  // /深处挂单 token，A-3 完全失明。以下常量驱动 REST 兜底核验的频率与阈值（用户已确认：沉默 20s、REST 连失败 3 次、
+  // 低频复核 60s）。
+  private static readonly BLIND_SWEEP_MS = 10_000;          // 扫描自身频率门控：每 10s 至多执行一次 REST 核验
+  private static readonly BLIND_SILENCE_MS = 20_000;        // 疑似盲区阈值：WS 沉默 >= 20s 才视为可疑
+  private static readonly BLIND_REST_REVERIFY_MS = 60_000;  // 低频复核：REST 确认安全后 60s 内不再重复 REST
+  private static readonly BLIND_MIN_ORDER_AGE_MS = 30_000;  // 订单太新不误判：挂单 < 30s 给 WS 首次推送留时间
+  private static readonly BLIND_REST_FAIL_STRIKES = 3;      // REST 连续失败 3 次才撤退（温和重试，不凭空撤）
   // Last WS-protect timestamp per venue. Cycle reads this inside the same lock right before quote-place: if
   // > cycleStartedAt, WS already cleared a position this cycle → skip placement to avoid re-pinning the token.
   private readonly lastWsProtectAt = new Map<VenueName, number>();
   // Protect-path forensic throttle state: mapKey(venue:tokenId:result) -> { key, ts }. Entries are tiny and
   // pruned opportunistically so a long-running bot doesn't accumulate unbounded dead state.
   private readonly protectLogThrottle = new Map<string, { key: string; ts: number }>();
+  // 盲区 REST 辅助扫描（仅 Predict）状态。Predict WS 对低流动性/深处挂单 token 可能静默（server 不推 delta，
+  // 非代码 bug），A-3 实时撤退对这些 token 失明。以下状态让扫描用 REST 兜底核验沉默 token：
+  private readonly everHadBook = new Map<VenueName, Set<string>>();        // 曾通过 WS/REST 拿到盘口（区分真裸单 vs 安静有效单）
+  private readonly lastBookPushAt = new Map<VenueName, Map<string, number>>(); // 最近 WS 推送时间；沉默 = now - 此值
+  private readonly lastRestSafeAt = new Map<VenueName, Map<string, number>>(); // 最近 REST 确认安全时间（低频复核门控）
+  private readonly bookFailStrikes = new Map<VenueName, Map<string, number>>(); // REST 连续失败计数（温和重试，3 次后撤退）
+  private lastBlindSweepAt = 0;
 
   constructor(
     private readonly config: AppConfig,
@@ -163,6 +178,8 @@ export class ExecutionEngine {
     // Predict: per-market, resolved to tokens in the adapter wrapper).
     if (typeof this.adapter.setBookUpdateListener === 'function') {
       this.adapter.setBookUpdateListener((tokenId) => {
+        // 记录 WS 推送到达：盲区扫描据此判断"沉默"，everHadBook 一旦置位永不在 60s 缓存过期时清除
+        this.noteBookPush(this.adapter.name, tokenId);
         void this.protectOnBookUpdate(this.adapter.name, tokenId);
       });
     }
@@ -174,6 +191,10 @@ export class ExecutionEngine {
     // hook always uses the freshest credentials.
     this.lastSigner = options.signer;
     this.lastSignerAddress = options.signer.address;
+    // 盲区 REST 辅助扫描（仅 Predict）：WS 静默 token 的 REST 兜底核验。自身每 BLIND_SWEEP_MS 节流，低频无损。
+    if (options.venue === 'predict') {
+      await this.sweepBlindSpotCashBuys();
+    }
     const signerAddress = options.signer.address;
     const dayStart = accountRiskWindowStart(options.venue, this.store);
     // WS user-channel reconcile: if the user channel disconnected since last cycle, record an event so the
@@ -1407,8 +1428,162 @@ export class ExecutionEngine {
       perVenue.delete(tokenId);
     }
   }
-}
 
+  /**
+   * 盲区 REST 辅助扫描（仅 Predict）。
+     * WS 主路径(A-3)只在 server 推送盘口时触发；对 server 静默的低流动性/深处挂单 token，A-3 完全失明。
+     * 本扫描针对"沉默 >= BLIND_SILENCE_MS 且无近期 REST 安全确认"的受管现金 BUY 单，用 REST 兜底核验：
+     *   - Type A: 从未拿到过盘口(everHadBook=false) 且 REST 连失败 BLIND_REST_FAIL_STRIKES 次 → 撤（真裸单）
+     *   - Type B: REST 盘口显示前方塌陷 → shouldRetreatThinFront 撤退
+     *   - Type C: REST 与最后已知盘口一致（良性沉默）→ 保留 + 记录 lastRestSafeAt
+     *   - Type D: 曾拿到盘口(everHadBook=true) 但 REST 连失败 BLIND_REST_FAIL_STRIKES 次 → 保守撤（盲区窗口封顶）
+     * 温和重试：REST 失败不立即撤，保留最后已知盘口(everHadBook=true 时)，下个扫描周期重验；连失败封顶才撤。
+     * 频率门控：每 BLIND_SWEEP_MS 至多一次；沉默 < BLIND_SILENCE_MS 跳过(A-3 实时覆盖)；最近 BLIND_REST_REVERIFY_MS
+     * 内已 REST 确认安全则跳过(低频复核)。仅 Predict：两市场模块完全独立，Polymarket 不走此路径。
+     */
+    private async sweepBlindSpotCashBuys(): Promise<void> {
+      const venue = this.adapter.name;
+      if (venue !== 'predict') return;
+      const now = Date.now();
+      if (now - this.lastBlindSweepAt < ExecutionEngine.BLIND_SWEEP_MS) return;
+      this.lastBlindSweepAt = now;
+      if (typeof this.adapter.getOrderbookRest !== 'function') return;
+
+      // 受管现金 BUY 单（bot 仅挂 cash 模式 BUY post-only，故 BUY+OPEN 即现金受保护单）
+      let managed: OpenOrder[];
+      try {
+        managed = this.store.listManagedOpenOrders(venue);
+      } catch {
+        try {
+          managed = (await this.adapter.getOpenOrders(this.lastSignerAddress ?? ''))
+            .filter((o) => o.status === 'OPEN' && o.side === 'BUY');
+        } catch {
+          managed = [];
+        }
+      }
+      const cashBuys = managed.filter((o) => o.status === 'OPEN' && o.side === 'BUY' && o.tokenId);
+      if (cashBuys.length === 0) return;
+
+      const restSafe = this.lastRestSafeAt.get(venue) ?? new Map<string, number>();
+      const failStrikes = this.bookFailStrikes.get(venue) ?? new Map<string, number>();
+      const hadBook = this.everHadBook.get(venue) ?? new Set<string>();
+      const pushAt = this.lastBookPushAt.get(venue) ?? new Map<string, number>();
+
+      const toCancel: string[] = [];
+      const reasons: Array<{ orderId: string; reason: string; tokenId: string }> = [];
+
+      for (const order of cashBuys) {
+        const tokenId = order.tokenId as string;
+        const silenceMs = pushAt.has(tokenId) ? now - (pushAt.get(tokenId) as number) : Number.POSITIVE_INFINITY;
+        const orderAgeMs = order.placedAt ? now - order.placedAt : 0;
+        // 1) 不沉默(A-3 实时覆盖) → 跳过
+        if (silenceMs < ExecutionEngine.BLIND_SILENCE_MS) continue;
+        // 2) 订单太新 → 给 WS 首次推送送达留时间，避免误判真裸单
+        if (orderAgeMs < ExecutionEngine.BLIND_MIN_ORDER_AGE_MS) continue;
+        // 3) 近期 REST 已确认安全 → 低频复核，跳过
+        const lastSafe = restSafe.get(tokenId);
+        if (lastSafe !== undefined && now - lastSafe < ExecutionEngine.BLIND_REST_REVERIFY_MS) continue;
+
+        // 沉默且需核验：尝试 REST 兜底
+        let restBook: Orderbook | undefined;
+        try {
+          restBook = await this.adapter.getOrderbookRest(tokenId);
+        } catch {
+          restBook = undefined;
+        }
+        if (!restBook) {
+          // REST 失败：温和重试。everHadBook=false 为真裸单，everHadBook=true 保留最后已知盘口
+          const strikes = (failStrikes.get(tokenId) ?? 0) + 1;
+          failStrikes.set(tokenId, strikes);
+          if (strikes >= ExecutionEngine.BLIND_REST_FAIL_STRIKES) {
+            toCancel.push(order.externalId);
+            reasons.push({
+              orderId: order.externalId,
+              tokenId,
+              reason: hadBook.has(tokenId)
+                ? `盲区 Type D: 曾拿到盘口但 REST 连续 ${strikes} 次失败，保守撤退（盲区窗口封顶）`
+                : `盲区 Type A: 从未拿到盘口且 REST 连续 ${strikes} 次失败，真裸单撤退`
+            });
+          } else {
+            // 重试期保留：删除安全时间戳，下个扫描周期(<=BLIND_SWEEP_MS)重验
+            restSafe.delete(tokenId);
+            this.logProtectJudgment(venue, tokenId, 'blind-rest-failed', { strikes });
+          }
+          continue;
+        }
+        // REST 成功：清除失败计数，标记 everHadBook
+        failStrikes.set(tokenId, 0);
+        hadBook.add(tokenId);
+        const market = this.marketDataSync.getMarketFromCache(venue, tokenId);
+        if (!market) {
+          // 无 market 元数据无法评估 → 视为安全保留（周期会补全），记录 REST 安全时间
+          restSafe.set(tokenId, now);
+          continue;
+        }
+        const retreat = shouldRetreatThinFront(this.config, venue, order, market, restBook);
+        if (retreat) {
+          // Type B: REST 盘口塌陷
+          toCancel.push(order.externalId);
+          reasons.push({
+            orderId: order.externalId,
+            tokenId,
+            reason: `盲区 Type B: REST 核验发现前方塌陷（${formatRetreatReasons(retreat)}），即时撤退`
+          });
+        } else {
+          // Type C: 良性沉默
+          restSafe.set(tokenId, now);
+        }
+      }
+
+      this.lastRestSafeAt.set(venue, restSafe);
+      this.bookFailStrikes.set(venue, failStrikes);
+      this.everHadBook.set(venue, hadBook);
+      this.lastBookPushAt.set(venue, pushAt);
+
+      if (toCancel.length === 0) return;
+      const release = await this.acquireProtectLock(venue);
+      try {
+        this.lastWsProtectAt.set(venue, Date.now());
+        try {
+          await this.adapter.cancelOrders(toCancel);
+          this.store.markOrdersCanceled(venue, toCancel);
+        } catch (err) {
+          // REST 兜底撤单失败(如市场已关闭)：记录错误，仍按已撤退处理避免周期重验噪声
+          this.store.recordEvent({
+            venue,
+            severity: 'error',
+            type: 'quote.blind-spot-retreat-failed',
+            message: err instanceof Error ? err.message : String(err),
+            details: { ids: toCancel, reasons }
+          });
+        }
+        const tokenRetreats = this.retreatedAt.get(venue) ?? new Map<string, number>();
+        for (const r of reasons) tokenRetreats.set(r.tokenId, Date.now());
+        this.retreatedAt.set(venue, tokenRetreats);
+        this.store.recordEvent({
+          venue,
+          severity: 'warn',
+          type: 'quote.blind-spot-retreat',
+          message: `盲区 REST 辅助扫描撤单 ${toCancel.length} 单（Predict）`,
+          details: { ids: toCancel, reasons }
+        });
+      } finally {
+        release();
+      }
+    }
+
+    /** 记录 WS 推送到达：盲区扫描据此判断沉默；everHadBook 一旦置位永不在 60s 缓存过期时清除。 */
+    private noteBookPush(venue: VenueName, tokenId: string): void {
+      let had = this.everHadBook.get(venue);
+      if (!had) { had = new Set<string>(); this.everHadBook.set(venue, had); }
+      had.add(tokenId);
+      let push = this.lastBookPushAt.get(venue);
+      if (!push) { push = new Map<string, number>(); this.lastBookPushAt.set(venue, push); }
+      push.set(tokenId, Date.now());
+      // WS 推送到达即认为盘口可用，清除 REST 失败计数
+      this.bookFailStrikes.get(venue)?.delete(tokenId);
+    }
+}
 function cashFillCircuitBreakerState(value: unknown): { active: boolean; positionFingerprint?: string; triggeredAt?: string } {
   if (!value || typeof value !== 'object') return { active: false };
   const state = value as { active?: unknown; positionFingerprint?: unknown; triggeredAt?: unknown };
