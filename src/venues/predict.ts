@@ -326,6 +326,12 @@ export class PredictVenue implements VenueAdapter {
     });
   }
 
+  /** Engine-layer hook for "Predict WS connection dropped". Forwards to the underlying WS client, which
+   *  fires it on the disconnect event — so the engine's force-cancel runs outside the main loop. */
+  setDisconnectListener(listener: (() => void) | undefined): void {
+    this.wsClient().setDisconnectListener(listener);
+  }
+
   wsWatchStats(): { connected: boolean; watchedMarkets: number; cachedOrderbooks: number } {
     const stats = this.wsClient().stats();
     return { connected: stats.connected, watchedMarkets: stats.watchedMarkets, cachedOrderbooks: stats.cachedOrderbooks };

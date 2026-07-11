@@ -103,6 +103,11 @@ export interface VenueAdapter {
     tokenId: string,
     kind: 'snapshot' | 'price_change'
   ) => void | undefined): void;
+  /** OPTIONAL: register a listener that fires when the venue's market-channel WS disconnects. The engine
+   *  wires this to an immediate force-cancel of all managed orders so disconnect protection is not gated
+   *  behind the (potentially stalled) main loop. Predict implements it; Polymarket currently leaves it
+   *  undefined and relies on the per-cycle gate. */
+  setDisconnectListener?(listener: (() => void) | undefined): void;
   getBalances(address: string, signer?: SignerProvider): Promise<Balance[]>;
   getPositions(address: string): Promise<Position[]>;
   getOpenOrders(address: string): Promise<OpenOrder[]>;

@@ -184,6 +184,41 @@ export class ExecutionEngine {
         void this.protectOnBookUpdate(this.adapter.name, tokenId);
       });
     }
+    // === 断线全撤解耦：把"WS 断线"事件直接接上 force-cancel，不再依赖主循环 runOnce。
+    // 即便主循环卡死在慢 API 上，WS onDisconnect 回调仍在 Node 事件循环里执行，订单不会裸奔。
+    if (typeof this.adapter.setDisconnectListener === 'function') {
+      const venue = this.adapter.name;
+      this.adapter.setDisconnectListener(() => void this.cancelAllManagedOnDisconnect(venue));
+    }
+  }
+
+  /** 断线全撤（WS 层事件触发，独立于主循环）。
+   *  由 predict-ws 的 onDisconnect 回调直接调用：某 venue 的 market-channel WS 断线时，无条件撤销该 venue
+   *  全部受管挂单。与主循环内 runOnce 的 WS 健康门控互为双保险——本方法经 WS 事件回调触发，即便主循环正卡在
+   *  慢 API 上，Node 事件循环空闲时仍会执行，从而杜绝"主循环卡死 + WS 断线同时发生"时的订单裸奔窗口。
+   *  幂等：重复调用只撤已撤的单，store 标记无害。 */
+  private async cancelAllManagedOnDisconnect(venue: VenueName): Promise<void> {
+    const managed = this.store.listManagedOpenOrders(venue);
+    if (managed.length === 0) return;
+    try {
+      const ids = managed.map((o) => o.externalId);
+      await this.adapter.cancelOrders(ids);
+      this.store.markOrdersCanceled(venue, ids);
+      this.recorder.event({
+        venue,
+        severity: 'warn',
+        type: 'ws.health.cancel-all-disconnect',
+        message: `WS 断线，无法实时监控盘口，撤销全部 ${managed.length} 个受管挂单`,
+        details: { canceledIds: ids, via: 'ws-disconnect-event' }
+      });
+    } catch (error) {
+      this.recorder.event({
+        venue,
+        severity: 'error',
+        type: 'ws.health.cancel-all-disconnect-failed',
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   async runOnce(options: RunOnceOptions): Promise<RunOnceResult> {

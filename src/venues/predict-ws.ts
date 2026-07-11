@@ -46,6 +46,11 @@ export class PredictWsClient {
    *  (not tokenId) because Predict WS pushes per-market orderbooks. Wrapped in try/catch at the invocation
    *  site so a buggy listener can never tear down the WS reader. */
   private bookUpdateListener?: ((marketId: string) => void);
+  /** Optional listener that fires when the underlying WS connection drops (close or error). The engine
+   *  wires this to a force-cancel of all managed orders so disconnect protection is NOT gated behind the
+   *  (potentially stalled) main runOnce loop. Wrapped in optional chaining at the call site so a missing
+   *  listener is a safe no-op (e.g. on the very first connect attempt before the engine has registered). */
+  private disconnectListener?: (() => void);
   private keepAlive = false;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnectAttempts = 0;
@@ -167,6 +172,13 @@ export class PredictWsClient {
     this.bookUpdateListener = listener;
   }
 
+  /** Register a listener that fires when the WS connection drops. The engine wires this to a force-cancel
+   *  of all managed orders so disconnect protection triggers immediately on the WS event — independent of
+   *  the main loop, which may be stalled on a slow Predict REST call at that moment. */
+  setDisconnectListener(listener: (() => void) | undefined): void {
+    this.disconnectListener = listener;
+  }
+
   close(): void {
     this.keepAlive = false;
     if (this.reconnectTimer) {
@@ -242,6 +254,9 @@ export class PredictWsClient {
     this.socket = undefined;
     this.connecting = undefined;
     this.activeTopics.clear();
+    // 断线即时全撤（独立于主循环）：WS 层事件回调直接触发 engine 的全撤，即便主循环正卡在慢 API 上，
+    // Node 事件循环空闲时仍会执行，杜绝"主循环卡死 + WS 断线"同时发生时的订单裸奔窗口。
+    this.disconnectListener?.();
     if (this.heartbeatCheckTimer) {
       clearInterval(this.heartbeatCheckTimer);
       this.heartbeatCheckTimer = undefined;
