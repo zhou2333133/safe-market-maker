@@ -251,7 +251,7 @@ describe('account sync service', () => {
     });
   });
 
-  it('uses local cash-fill exit losses as a stop-loss fallback when venue fills are missing', async () => {
+  it('keeps the local cash-fill exit estimate diagnostic-only and never lets it drive a stop', async () => {
     await withStore(async (store) => {
       const config = appConfigSchema.parse({
         liveEnabled: true,
@@ -291,12 +291,79 @@ describe('account sync service', () => {
         dayStart: Date.now() - 60_000
       });
 
-      expect(decision).toMatchObject({
-        ok: false,
-        reason: 'daily-loss-limit',
-        dailyPnlUsd: -0.2312,
-        realizedPnlUsd: -0.2312
+      // The venue snapshot reports no genuine loss (realized 0, equity 100 with a captured baseline), so the
+      // bogus local estimate (-0.2312) must NOT mutate realizedPnlUsd nor trip the stop. It stays diagnostic.
+      expect(decision.ok).toBe(true);
+      expect(decision.reason).toBe('ok');
+      expect(decision.realizedPnlUsd).toBe(0);
+      expect(decision.dailyPnlUsd).toBe(0);
+      expect(decision.warnings.join(' ')).toContain('Local cash-fill exit fallback estimated 0.2312');
+    });
+  });
+
+  it('does not false-stop across a midnight roll when the real net cashflow loss is within the limit', async () => {
+    await withStore(async (store) => {
+      const dayStart = Date.now() - 3 * 60 * 60_000; // window starts ~3h ago (simulates a midnight roll)
+      const config = appConfigSchema.parse({
+        liveEnabled: true,
+        risk: { maxDailyLossUsd: 5 }
       });
+      const venue = new AccountSyncMockVenue();
+      // A verified pre-window equity reading (the truest "equity at day start").
+      store.recordAccountRiskSnapshot({
+        venue: 'predict',
+        account: signer.address,
+        source: 'venue+chain',
+        capturedAt: dayStart - 20 * 60 * 60_000,
+        dayStart: dayStart - 20 * 60 * 60_000,
+        equityUsd: 67.19,
+        unrealizedPnlUsd: 0,
+        fills: [],
+        positions: [],
+        balances: [{ asset: 'USDT', available: 67.19, total: 67.19 }],
+        warnings: []
+      });
+      // The live-session started long before the window (a long-running session that crossed midnight).
+      store.checkpoint('live-session.predict', {
+        startedAt: new Date(dayStart - 5 * 24 * 60 * 60_000).toISOString(),
+        source: 'user-start'
+      });
+      // Current snapshot: flat book, genuine net cashflow -1.39 (fees included). A bogus local cash-fill
+      // exit estimate of -6.46 would have tripped the OLD stop; it must not here.
+      venue.snapshot = {
+        equityUsd: 65.8,
+        realizedPnlUsd: -1.39,
+        netCashflowUsd: -1.39,
+        unrealizedPnlUsd: 0,
+        positions: [],
+        balances: [{ asset: 'USDT', available: 65.8, total: 65.8 }]
+      };
+      store.recordEvent({
+        venue: 'predict',
+        severity: 'warn',
+        type: 'cash-fill.exit-submitted',
+        message: '现金单边止损退出已提交：exit-bogus',
+        details: {
+          intent: { tokenId: 'token-1', side: 'SELL', price: 0.1, size: 100, notionalUsd: 10 },
+          position: { tokenId: 'token-1', marketId: 'market-1', outcome: 'X', size: 100, notionalUsd: 13, averagePrice: 0.13 },
+          averagePrice: 0.13,
+          limitPrice: 0.1
+        }
+      });
+
+      const decision = await new AccountSyncService(config, venue, store).accountRiskGate({
+        venue: 'predict',
+        signerAddress: signer.address,
+        signer,
+        dayStart
+      });
+
+      // No false stop: the real loss (-1.39, fee-inclusive) is reflected from the balance/equity delta,
+      // not the bogus -6.46 limit-price estimate.
+      expect(decision.ok).toBe(true);
+      expect(decision.reason).toBe('ok');
+      expect(decision.dailyPnlUsd).toBeCloseTo(-1.39, 2);
+      expect(decision.realizedPnlUsd).toBeCloseTo(-1.39, 2);
       expect(decision.warnings.join(' ')).toContain('Local cash-fill exit fallback');
     });
   });

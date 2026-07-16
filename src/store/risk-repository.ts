@@ -232,6 +232,22 @@ export class RiskRepository {
     };
   }
 
+  getNearestAccountEquity(venue: VenueName, aroundTs: number): AccountEquityPoint | undefined {
+    const row = this.db.prepare(`
+      SELECT ts, equity_usd
+      FROM account_risk_snapshots
+      WHERE venue = ?
+        AND equity_usd IS NOT NULL
+      ORDER BY ABS(ts - ?) ASC
+      LIMIT 1
+    `).get(venue, aroundTs) as { ts: number; equity_usd: number } | undefined;
+    if (!row || !Number.isFinite(row.equity_usd)) return undefined;
+    return {
+      capturedAt: Number(row.ts),
+      equityUsd: Number(row.equity_usd)
+    };
+  }
+
   summarizeFills(venue: VenueName, sinceTs: number): FillSummary {
     const row = this.db.prepare(`
       SELECT

@@ -302,6 +302,10 @@ export class StateStore {
     return this.risks.getEarliestAccountEquitySince(venue, sinceTs);
   }
 
+  getNearestAccountEquity(venue: VenueName, aroundTs: number): AccountEquityPoint | undefined {
+    return this.risks.getNearestAccountEquity(venue, aroundTs);
+  }
+
   recordMetric(name: string, value: number, labels: Record<string, unknown> = {}): void {
     this.observability.recordMetric(name, value, labels);
   }

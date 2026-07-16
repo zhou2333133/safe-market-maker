@@ -131,16 +131,18 @@ export class AccountSyncService {
   ): AccountRiskSnapshot {
     const local = this.store.localCashExitLossSince(venue, dayStart);
     if (local.estimatedLossUsd <= 0) return snapshot;
-    const platformRealized = Number.isFinite(snapshot.realizedPnlUsd) ? Number(snapshot.realizedPnlUsd) : undefined;
-    const fallbackRealized = local.estimatedRealizedPnlUsd;
-    if (platformRealized !== undefined && platformRealized <= fallbackRealized) return snapshot;
+    // Diagnostic only. The estimate is derived from the cash-fill EXIT LIMIT PRICE, which sits BELOW the
+    // actual fill price (the cashMaxExitLossPct safety band), so it systematically OVERSTATES the realized
+    // loss and ignores fees. It must never overwrite the venue-reported realized PnL / net cashflow, which
+    // already include fees and reflect the real fill prices. Feeding it into dailyPnl previously caused a
+    // false daily-loss stop (incident 2026-07-16: estimated -$6.46 vs real net cashflow -$1.39). The
+    // authoritative daily PnL is the balance/equity delta captured by withLiveSessionEquityBaseline.
     return {
       ...snapshot,
       source: snapshot.source === 'venue' ? 'venue+chain' : snapshot.source,
-      realizedPnlUsd: fallbackRealized,
       warnings: [
         ...snapshot.warnings,
-        `Local cash-fill exit fallback estimated ${local.estimatedLossUsd.toFixed(4)} USD loss because venue fills may be incomplete.`
+        `Local cash-fill exit fallback estimated ${local.estimatedLossUsd.toFixed(4)} USD loss (diagnostic only; not used for stop-loss — venue fills may be incomplete).`
       ],
       raw: {
         ...(snapshot.raw && typeof snapshot.raw === 'object' ? snapshot.raw as Record<string, unknown> : {}),
@@ -156,38 +158,55 @@ export class AccountSyncService {
   ): AccountRiskSnapshot {
     const checkpointName = `live-session.${venue}`;
     const checkpoint = this.store.getCheckpoint(checkpointName)?.value;
-    if (!checkpoint || typeof checkpoint !== 'object') return snapshot;
-    const value = checkpoint as Record<string, unknown>;
-    const startedAt = typeof value.startedAt === 'string' ? Date.parse(value.startedAt) : NaN;
-    if (!Number.isFinite(startedAt) || Math.abs(startedAt - dayStart) > 1000) return snapshot;
+    const value = checkpoint && typeof checkpoint === 'object' ? (checkpoint as Record<string, unknown>) : {};
+    // Reuse a baseline we already captured for THIS dayStart window (so a long-running session does not
+    // re-baseline mid-day and lose the day's loss accounting).
+    const baselineDayStart = Number(value.baselineDayStart);
     const storedEquity = Number(value.equityUsd);
-    // A non-positive stored baseline is POISONED: the equity read failed at session start and persisted 0. Trusting it
-    // pegs dayStartEquityUsd at 0 and breaks the drawdown/PnL math (and blinds the stop). Treat it as "not captured" so
-    // the block below re-captures a real baseline from the current/historical snapshot and rewrites the checkpoint.
-    if (Number.isFinite(storedEquity) && storedEquity > 0) {
+    if (Number.isFinite(baselineDayStart) && baselineDayStart === dayStart
+        && Number.isFinite(storedEquity) && storedEquity > 0) {
       return { ...snapshot, dayStartEquityUsd: storedEquity };
     }
-    const historical = this.store.getEarliestAccountEquitySince(venue, dayStart);
-    const historicalDelayMs = historical ? historical.capturedAt - dayStart : Number.POSITIVE_INFINITY;
+
+    // Capture the day-start equity baseline from the balance/equity the venue actually reports. The daily
+    // PnL is the balance delta (equity - dayStartEquity), which inherently includes fees. We prefer the
+    // verified account snapshot nearest in time to dayStart (a pre-window reading is the truest "equity at
+    // midnight"; a post-window reading is used when no pre-window reading exists). We fall back to the
+    // current snapshot ONLY when it is trustworthy: within the tight window of dayStart (fresh start) OR
+    // with no open positions (a flat book cannot hide an underwater position). A current snapshot that is
+    // both late AND carries open positions is NOT trusted — we fail closed (no baseline) so an old session
+    // loss can't be disguised by treating the current equity as the baseline.
+    const NEAREST_BASELINE_MAX_MS = 24 * 60 * 60_000;
+    const nearest = this.store.getNearestAccountEquity(venue, dayStart);
+    const nearestDelayMs = nearest ? Math.abs(nearest.capturedAt - dayStart) : Number.POSITIVE_INFINITY;
+    const hasOpenPositions = snapshot.positions.some(
+      (position) => Math.abs(position.size) > 1e-9 || Math.abs(position.notionalUsd) > 0.01
+    );
     const currentDelayMs = snapshot.capturedAt - dayStart;
-    const baseline = historical && historicalDelayMs >= 0 && historicalDelayMs <= LIVE_SESSION_BASELINE_MAX_DELAY_MS
-      ? {
-          equityUsd: historical.equityUsd,
-          capturedAt: historical.capturedAt,
-          source: 'historical-account-snapshot'
-        }
-      : Number.isFinite(snapshot.equityUsd) && currentDelayMs >= 0 && currentDelayMs <= LIVE_SESSION_BASELINE_MAX_DELAY_MS
-        ? {
-            equityUsd: Number(snapshot.equityUsd),
-            capturedAt: snapshot.capturedAt,
-            source: 'current-account-snapshot'
-          }
-        : undefined;
+    const currentEquity = snapshot.equityUsd ?? NaN;
+    const currentTrusted = Number.isFinite(currentEquity) && currentEquity > 0
+      && (currentDelayMs >= 0 && currentDelayMs <= LIVE_SESSION_BASELINE_MAX_DELAY_MS || !hasOpenPositions);
+
+    let baseline:
+      | { equityUsd: number; source: 'pre-window-account-snapshot' | 'historical-account-snapshot' | 'current-account-snapshot' }
+      | undefined;
+    if (nearest && nearestDelayMs <= NEAREST_BASELINE_MAX_MS && nearest.equityUsd > 0) {
+      baseline = {
+        equityUsd: nearest.equityUsd,
+        source: nearest.capturedAt < dayStart ? 'pre-window-account-snapshot' : 'historical-account-snapshot'
+      };
+    } else if (currentTrusted) {
+      baseline = { equityUsd: currentEquity, source: 'current-account-snapshot' };
+    }
     if (!baseline) return snapshot;
+
     this.store.checkpoint(checkpointName, {
       ...value,
       equityUsd: baseline.equityUsd,
-      equityCapturedAt: new Date(baseline.capturedAt).toISOString(),
+      baselineDayStart: dayStart,
+      equityCapturedAt: new Date(
+        baseline.source === 'current-account-snapshot' ? snapshot.capturedAt : nearest!.capturedAt
+      ).toISOString(),
       equitySource: baseline.source
     });
     return {
@@ -195,9 +214,9 @@ export class AccountSyncService {
       dayStartEquityUsd: baseline.equityUsd,
       warnings: [
         ...snapshot.warnings,
-        baseline.source === 'historical-account-snapshot'
-          ? 'Live-session equity baseline restored from the earliest verified account snapshot.'
-          : 'Live-session equity baseline captured from the first account snapshot.'
+        baseline.source === 'current-account-snapshot'
+          ? 'Live-session equity baseline captured from the first account snapshot.'
+          : 'Live-session equity baseline restored from the nearest verified account snapshot.'
       ]
     };
   }
